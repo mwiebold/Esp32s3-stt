@@ -1,0 +1,8 @@
+# NeMo conformer-ctc-small layout. On a 16 MB board (N16R8) drop the 'audio' line (live mic mode).
+# Name,   Type, SubType, Offset,    Size
+nvs,      data, nvs,     0x9000,    0x6000
+phy_init, data, phy,     0xf000,    0x1000
+factory,  app,  factory, 0x10000,   0x80000
+model,    data, 0x40,    0x90000,   0xE10000
+lm,       data, 0x42,    0xEA0000,  0x160000
+audio,    data, 0x41,    0x1000000, 0x800000

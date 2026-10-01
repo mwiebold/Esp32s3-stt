@@ -1,0 +1,7 @@
+# NeMo + LM on 16 MB flash (N16R8). 'audio' holds up to ~24 s of benchmark clips (unused by live-mic builds).
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x80000
+model,    data, 0x40,    0x90000,  0xD60000
+lm,       data, 0x42,    0xDF0000, 0x150000
+audio,    data, 0x41,    0xF40000, 0xC0000

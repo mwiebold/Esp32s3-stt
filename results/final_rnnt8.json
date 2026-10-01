@@ -1,0 +1,14 @@
+{
+ "model": "models/rnnt8.tnm",
+ "chunk": 32,
+ "left": 2,
+ "greedy": {
+  "test-clean": 2.98879439910203,
+  "test-other": 6.668068190505313,
+  "val_cv.local.jsonl": 9.553405523162683,
+  "val_vox.local.jsonl": 8.247387473533228,
+  "val_ami.local.jsonl": 19.221577330146808,
+  "val_ps.local.jsonl": 11.560900716479017,
+  "val_e22.local.jsonl": 21.022364217252395
+ }
+}

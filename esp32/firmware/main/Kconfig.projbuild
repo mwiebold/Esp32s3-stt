@@ -1,0 +1,49 @@
+menu "tinyasr"
+    choice TASR_MODE
+        prompt "Input source"
+        default TASR_MODE_FILE
+        config TASR_MODE_FILE
+            bool "Benchmark: utterances stored in the 'audio' partition"
+        config TASR_MODE_MIC
+            bool "Live: I2S MEMS microphone (e.g. INMP441)"
+    endchoice
+    config TASR_I2S_BCLK
+        int "I2S BCLK (SCK) GPIO"
+        default 4
+    config TASR_I2S_WS
+        int "I2S WS (LRCL) GPIO"
+        default 5
+    config TASR_I2S_DIN
+        int "I2S data-in (SD) GPIO"
+        default 6
+    config TASR_OLED
+        bool "SSD1306 128x64 I2C OLED showing the live transcript"
+        default n
+    config TASR_OLED_SDA
+        int "OLED SDA GPIO"
+        default 8
+        depends on TASR_OLED
+    config TASR_OLED_SCL
+        int "OLED SCL GPIO"
+        default 9
+        depends on TASR_OLED
+    config TASR_OLED_ADDR
+        hex "OLED I2C address"
+        default 0x3C
+        depends on TASR_OLED
+    config TASR_CHUNK
+        int "Encoder chunk (25 Hz frames, even); 32 = 1.28 s"
+        default 32
+    config TASR_LEFT
+        int "Attention history in chunks"
+        default 2
+    config TASR_BEAM
+        int "Beam width when an LM partition is present"
+        default 4
+    config TASR_LM_WEIGHT_X100
+        int "LM weight x100"
+        default 60
+    config TASR_TOKEN_BONUS_X100
+        int "Token insertion bonus x100"
+        default 250
+endmenu

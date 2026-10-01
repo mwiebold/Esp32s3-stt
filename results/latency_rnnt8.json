@@ -1,0 +1,99 @@
+{
+ "model": "rnnt8.tnm",
+ "n": 6,
+ "wer": 0.0,
+ "median_text_after_s": [
+  2.972322157291667,
+  3.4165811166666664
+ ],
+ "max_text_after_s": [
+  3.6536588781250003,
+  4.239087850000001
+ ],
+ "rows": [
+  {
+   "audio_s": 2.23,
+   "instr_M": 469.229475,
+   "compute_s": [
+    1.5763128109375004,
+    1.8989080750000005
+   ],
+   "text_after_s": [
+    2.3763128109375007,
+    2.6989080750000003
+   ],
+   "ref": "he tried to think how it could be",
+   "hyp": "he tried to think how it could be"
+  },
+  {
+   "audio_s": 3.44,
+   "instr_M": 735.820375,
+   "compute_s": [
+    2.4673315338541673,
+    2.973208041666667
+   ],
+   "text_after_s": [
+    3.2673315338541675,
+    3.773208041666667
+   ],
+   "ref": "he had the faith in him that moves mountains",
+   "hyp": "he had the faith in him that moves mountains"
+  },
+  {
+   "audio_s": 3.09,
+   "instr_M": 646.19485,
+   "compute_s": [
+    2.1723221572916667,
+    2.6165811166666666
+   ],
+   "text_after_s": [
+    2.972322157291667,
+    3.4165811166666664
+   ],
+   "ref": "again again",
+   "hyp": "again again"
+  },
+  {
+   "audio_s": 2.4,
+   "instr_M": 507.22145,
+   "compute_s": [
+    1.7030972364583332,
+    2.0518119833333333
+   ],
+   "text_after_s": [
+    2.5030972364583333,
+    2.8518119833333335
+   ],
+   "ref": "then he comes to the beak of it",
+   "hyp": "then he comes to the beak of it"
+  },
+  {
+   "audio_s": 3.02,
+   "instr_M": 633.278725,
+   "compute_s": [
+    2.1282428682291665,
+    2.5636219916666665
+   ],
+   "text_after_s": [
+    2.928242868229167,
+    3.3636219916666663
+   ],
+   "ref": "it must remember be one or the other",
+   "hyp": "it must remember be one or the other"
+  },
+  {
+   "audio_s": 3.96,
+   "instr_M": 851.53305,
+   "compute_s": [
+    2.8536588781250005,
+    3.439087850000001
+   ],
+   "text_after_s": [
+    3.6536588781250003,
+    4.239087850000001
+   ],
+   "ref": "ojo examined this curious contrivance with wonder",
+   "hyp": "ojo examined this curious contrivance with wonder"
+  }
+ ]
+}

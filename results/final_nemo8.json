@@ -1,0 +1,23 @@
+{
+ "model": "models/nemo8.tnm",
+ "chunk": 32,
+ "left": 2,
+ "greedy": {
+  "test-clean": 3.698419040009132,
+  "test-other": 8.233315495757205,
+  "val_cv.local.jsonl": 11.37950919459217,
+  "val_vox.local.jsonl": 9.258247387473533,
+  "val_ami.local.jsonl": 20.151928986002048,
+  "val_ps.local.jsonl": 11.642784032753326,
+  "val_e22.local.jsonl": 22.438764643237487
+ },
+ "beam_lm": {
+  "test-clean": 3.3236306907900994,
+  "test-other": 7.275819891445608,
+  "val_cv.local.jsonl": 10.130069840456205,
+  "val_vox.local.jsonl": 8.971381736220204,
+  "val_ami.local.jsonl": 18.96551724137931,
+  "val_ps.local.jsonl": 11.01842374616172,
+  "val_e22.local.jsonl": 20.759166286322834
+ }
+}

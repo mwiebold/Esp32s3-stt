@@ -1,0 +1,6 @@
+# Transducer (RNN-T, int8, 15.5 MB, no external LM needed) on 16 MB flash (N16R8). 'audio' holds ~22 s of benchmark clips.
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x60000
+model,    data, 0x40,    0x70000,  0xEE0000
+audio,    data, 0x41,    0xF50000, 0xB0000

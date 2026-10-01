@@ -1,0 +1,7 @@
+moonshine-tiny test-clean: WER 5.00% (500 utts, 67s)
+moonshine-tiny test-other: WER 12.13% (500 utts, 76s)
+moonshine-tiny val_cv: WER 17.54% (500 utts, 44s)
+moonshine-tiny val_vox: WER 13.37% (500 utts, 75s)
+moonshine-tiny val_ami: WER 24.24% (500 utts, 40s)
+moonshine-tiny val_ps: WER 8.13% (500 utts, 113s)
+moonshine-tiny val_e22: WER 32.36% (500 utts, 64s)

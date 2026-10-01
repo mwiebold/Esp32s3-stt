@@ -1,0 +1,7 @@
+whisper-tiny.en test-clean: WER 6.26% (500 utts, 72s)
+whisper-tiny.en test-other: WER 15.93% (500 utts, 86s)
+whisper-tiny.en val_cv: WER 19.65% (500 utts, 35s)
+whisper-tiny.en val_vox: WER 13.49% (500 utts, 83s)
+whisper-tiny.en val_ami: WER 21.48% (500 utts, 42s)
+whisper-tiny.en val_ps: WER 14.26% (500 utts, 78s)
+whisper-tiny.en val_e22: WER 20.32% (500 utts, 48s)

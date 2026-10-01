@@ -1,0 +1,7 @@
+vosk-small test-clean: WER 9.95% (500 utts, 49s)
+vosk-small test-other: WER 21.61% (500 utts, 47s)
+vosk-small val_cv: WER 27.10% (500 utts, 41s)
+vosk-small val_vox: WER 20.56% (500 utts, 57s)
+vosk-small val_ami: WER 34.09% (500 utts, 36s)
+vosk-small val_ps: WER 12.90% (500 utts, 79s)
+vosk-small val_e22: WER 38.04% (500 utts, 70s)
