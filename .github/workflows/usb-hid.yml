@@ -1,0 +1,23 @@
+name: USB HID dictation validation
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/usb-hid.yml', 'esp32/firmware/**', 'esp32/tools/flash.sh', 'tests/*hid*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Archive tracked source for reproducible local validation
+        run: git archive --format=tar.gz HEAD > /tmp/usb-hid-source.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: usb-hid-source
+          path: /tmp/usb-hid-source.tar.gz
+          retention-days: 3
