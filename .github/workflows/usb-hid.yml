@@ -3,21 +3,62 @@ on:
   push:
     branches: [main]
     paths: ['.github/workflows/usb-hid.yml', 'esp32/firmware/**', 'esp32/tools/flash.sh', 'tests/*hid*']
+  pull_request:
+    paths: ['.github/workflows/usb-hid.yml', 'esp32/firmware/**', 'esp32/tools/flash.sh', 'tests/*hid*']
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: usb-hid-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  source:
+  native:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Archive tracked source for reproducible local validation
-        run: git archive --format=tar.gz HEAD > /tmp/usb-hid-source.tar.gz
+      - run: bash tests/run_hid.sh
+  firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: espressif/idf:v5.5
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [nemo8, nemo4_oled]
+    env:
+      IDF_TARGET: esp32s3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compile keyboard firmware and assert resolved configuration
+        shell: bash
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh"
+          cd esp32/firmware
+          defaults='sdkconfig.defaults;sdkconfig.nemo16lm;sdkconfig.mic;sdkconfig.usb_hid'
+          if [[ '${{ matrix.model }}' == nemo4_oled ]]; then
+            printf '%s\n' 'CONFIG_TASR_USB_LED_GPIO=7' > sdkconfig.ci_hid_led
+            defaults='sdkconfig.defaults;sdkconfig.nemo4;sdkconfig.mic;sdkconfig.usb_hid;sdkconfig.oled;sdkconfig.ci_hid_led'
+          fi
+          idf.py -B build_hid -D SDKCONFIG=sdkconfig_hid -D "SDKCONFIG_DEFAULTS=$defaults" build
+          grep -qx 'CONFIG_TASR_USB_HID=y' sdkconfig_hid
+          grep -qx 'CONFIG_TINYUSB_HID_COUNT=1' sdkconfig_hid
+          grep -qx 'CONFIG_TINYUSB_TASK_PRIORITY=24' sdkconfig_hid
+          grep -qx 'CONFIG_TINYUSB_TASK_AFFINITY_CPU0=y' sdkconfig_hid
+          grep -qx 'CONFIG_ESP_CONSOLE_UART_DEFAULT=y' sdkconfig_hid
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: usb-hid-source
-          path: /tmp/usb-hid-source.tar.gz
-          retention-days: 3
+          name: usb-hid-${{ matrix.model }}
+          path: |
+            esp32/firmware/build_hid/tinyasr_fw.bin
+            esp32/firmware/build_hid/bootloader/bootloader.bin
+            esp32/firmware/build_hid/partition_table/partition-table.bin
+            esp32/firmware/build_hid/flash_args
+            esp32/firmware/sdkconfig_hid
+            esp32/firmware/dependencies.lock
+          retention-days: 14

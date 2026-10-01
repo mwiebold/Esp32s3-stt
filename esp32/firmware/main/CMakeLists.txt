@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" "mic.c" "oled.c" "oled_render.c" INCLUDE_DIRS "." REQUIRES tinyasr esp_partition spi_flash esp_timer esp_psram esp_driver_i2s esp_driver_i2c)
+idf_component_register(SRCS "main.c" "mic.c" "oled.c" "oled_render.c" "usb_hid.c" "hid_dictation_core.c" INCLUDE_DIRS "." REQUIRES tinyasr esp_partition spi_flash esp_timer esp_psram esp_driver_i2s esp_driver_i2c esp_driver_gpio esp_hw_support esp_tinyusb)

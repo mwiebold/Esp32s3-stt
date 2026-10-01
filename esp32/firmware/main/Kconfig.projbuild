@@ -16,6 +16,32 @@ menu "tinyasr"
     config TASR_I2S_DIN
         int "I2S data-in (SD) GPIO"
         default 6
+    config TASR_USB_HID
+        bool "USB HID dictation keyboard (native USB, US layout)"
+        default n
+        depends on TASR_MODE_MIC && IDF_TARGET_ESP32S3
+        help
+            Use sdkconfig.usb_hid or TASR_USB_HID=1 tools/flash.sh to also
+            configure TinyUSB. Starts paused; BOOT toggles dictation. Text is
+            typed into the focused application with a space, never Enter.
+    config TASR_USB_BUTTON_GPIO
+        int "Active-low dictation toggle GPIO (BOOT = 0)"
+        range 0 48
+        default 0
+        depends on TASR_USB_HID
+    config TASR_USB_LED_GPIO
+        int "Optional active-high armed LED GPIO (-1 disables)"
+        range -1 48
+        default -1
+        depends on TASR_USB_HID
+        help
+            Use an ordinary external LED plus resistor, not an addressable RGB LED.
+            GPIO7 is free with the default microphone/OLED wiring.
+    config TASR_USB_REPORT_INTERVAL_MS
+        int "Minimum interval between USB key press/release reports (ms)"
+        range 10 100
+        default 10
+        depends on TASR_USB_HID
     config TASR_OLED
         bool "SSD1306 128x64 I2C OLED showing the live transcript"
         default n

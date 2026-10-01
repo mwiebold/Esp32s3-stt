@@ -18,6 +18,7 @@
 #include "mic.h"
 #include "tasr_seg.h"
 #include "oled.h"
+#include "usb_hid.h"
 
 #ifdef CONFIG_TASR_MODE_MIC
 #define MIC_CHECK(expr) do { if (!(expr)) { ESP_LOGE("mic", "failed: %s", #expr); abort(); } } while (0)
@@ -28,13 +29,14 @@
 
 typedef struct {
     int64_t end_us;
-    uint32_t sequence;
+    uint32_t sequence, session;
     int16_t pcm[BLOCK_SAMPLES];
 } mic_block_t;
 typedef struct {
     int16_t *pcm;
     int samples;
     int64_t end_us;
+    uint32_t session;
 } utterance_t;
 
 static QueueHandle_t g_audio, g_free, g_ready;
@@ -56,6 +58,7 @@ static int audio_queue_prepare(void)
 int mic_nemo_prepare(void)
 {
     if (g_ready) return 1;
+    if (usb_hid_init() != ESP_OK) return 0;
     if (!audio_queue_prepare()) return 0;
     g_free = xQueueCreate(POOL_SIZE, sizeof(int16_t *));
     g_ready = xQueueCreate(POOL_SIZE - 1, sizeof(utterance_t));
@@ -81,11 +84,27 @@ static void capture_task(void *arg)
     mic_block_t block;
     uint32_t sequence = 0;
     float dc = 0.f;
+#ifdef CONFIG_TASR_USB_HID
+    uint32_t previous_session = 0;
+    int64_t settle_until = 0;
+#endif
     for (;;) {
+        const uint32_t before_session = usb_hid_session();
         size_t got = 0;
         const esp_err_t rc = i2s_channel_read(g_rx, raw, sizeof(raw), &got, portMAX_DELAY);
         block.sequence = sequence++;
         block.end_us = esp_timer_get_time();
+        block.session = usb_hid_session();
+#ifdef CONFIG_TASR_USB_HID
+        // Continuously drain I2S even while paused. After arming, discard 200 ms
+        // (more than all eight DMA descriptors) to exclude old buffered samples.
+        if (block.session != previous_session) {
+            previous_session = block.session;
+            settle_until = block.end_us + 200000;
+        }
+        if (block.end_us < settle_until) block.session = 0;
+#endif
+        if (block.session != before_session) block.session = 0;
         if (rc != ESP_OK || got != sizeof(raw)) {
             atomic_fetch_add_explicit(&g_io_errors, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_dropped_samples, got / sizeof(raw[0]), memory_order_relaxed);
@@ -107,6 +126,7 @@ static void mic_start(void)
 {
     static int started;
     if (started) return;
+    MIC_CHECK(usb_hid_init() == ESP_OK);
     MIC_CHECK(audio_queue_prepare());
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     cc.dma_desc_num = 8;
@@ -153,7 +173,7 @@ static void segment_task(void *arg)
     tasr_seg_t seg;
     tasr_seg_init(&seg, recording, UTT_SAMPLES);
     mic_block_t block;
-    uint32_t expected = 0;
+    uint32_t expected = 0, recording_session = 0;
     int have_sequence = 0;
     for (;;) {
         if (xQueueReceive(g_audio, &block, portMAX_DELAY) != pdTRUE) continue;
@@ -164,9 +184,21 @@ static void segment_task(void *arg)
         }
         expected = block.sequence + 1;
         have_sequence = 1;
+        const uint32_t live_session = usb_hid_session();
+        if (block.session != recording_session) { tasr_seg_next(&seg); recording_session = block.session; }
+        if (!live_session || block.session != live_session) {
+            // Calibrate the noise floor without retaining paused audio as pre-roll.
+            int16_t ignored[BLOCK_SAMPLES];
+            tasr_seg_vad(&seg, block.pcm, ignored, BLOCK_SAMPLES);
+            tasr_seg_next(&seg);
+            continue;
+        }
         if (!tasr_seg_feed(&seg, block.pcm, BLOCK_SAMPLES)) continue;
         const int tail_ms = CONFIG_TASR_INFERENCE_TAIL_MS;
-        utterance_t utt = {recording, tasr_seg_audio_samples(&seg, tail_ms < 0 ? -1 : tail_ms * 16), block.end_us};
+        utterance_t utt = {
+            .pcm = recording, .samples = tasr_seg_audio_samples(&seg, tail_ms < 0 ? -1 : tail_ms * 16),
+            .end_us = block.end_us, .session = recording_session,
+        };
         int16_t *next = NULL;
         // Keep one buffer for recording. If no free buffer remains, discard this
         // completed utterance, never block segmentation or overwrite queued audio.
@@ -190,15 +222,26 @@ void run_mic_nemo(tasr_nemo_workspace_t *ws, struct tasr_decoder *dec)
 {
     MIC_CHECK(ws && mic_nemo_prepare());
     oled_start();
-    oled_status("* listening");
+    oled_status(usb_hid_status());
     MIC_CHECK(xTaskCreatePinnedToCore(segment_task, "mic_seg", 8192, NULL,
                                         configMAX_PRIORITIES - 2, NULL, 0) == pdPASS);
     mic_start();
+    usb_hid_input_ready();
+    oled_status(usb_hid_status());
     static char text[4096];
     utterance_t utt;
     printf("ready: speak, the transcript prints after each pause\n");
     for (;;) {
-        if (xQueueReceive(g_ready, &utt, pdMS_TO_TICKS(1000)) != pdTRUE) { report_overflow(); continue; }
+        if (xQueueReceive(g_ready, &utt, pdMS_TO_TICKS(100)) != pdTRUE) {
+            const char *status = usb_hid_status();
+            static const char *last_status;
+            if (status != last_status) { oled_status(status); last_status = status; }
+            report_overflow(); continue;
+        }
+        if (!utt.session || utt.session != usb_hid_session()) {
+            MIC_CHECK(xQueueSend(g_free, &utt.pcm, 0) == pdTRUE);
+            continue;
+        }
         oled_status("transcribing...");
         const int64_t t0 = esp_timer_get_time();
         const int rc = tasr_nemo_transcribe_with_workspace(ws, utt.pcm, utt.samples, dec, text, sizeof(text), NULL, 0, NULL);
@@ -211,8 +254,11 @@ void run_mic_nemo(tasr_nemo_workspace_t *ws, struct tasr_decoder *dec)
             const double dt = (done - t0) / 1e6, audio_s = utt.samples / 16000.0;
             printf("%s   [%.2f s input, %.3f s compute, RTF %.3f, queue %.3f s, endpoint-to-text %.3f s]\n",
                    text, audio_s, dt, dt / audio_s, (t0 - utt.end_us) / 1e6, (done - utt.end_us) / 1e6);
+            // Submission rechecks the capture generation after the blocking
+            // inference. Pausing/reconnecting can never replay an old transcript.
+            if (text[0]) usb_hid_submit(text, utt.session);
             oled_push(text[0] ? text : "(nothing recognized)");
-            oled_status("* listening");
+            oled_status(usb_hid_status());
         }
         report_overflow();
     }
@@ -225,9 +271,10 @@ void run_mic(tasr_stream_t *s)
     tasr_seg_t vad;
     tasr_seg_init(&vad, NULL, 0);
     oled_start();
-    oled_status("* listening (stream)");
+    usb_hid_input_ready();
+    oled_status(usb_hid_status());
     mic_block_t block;
-    uint32_t expected = 0;
+    uint32_t expected = 0, recording_session = 0;
     int have_sequence = 0;
     for (;;) {
         if (xQueueReceive(g_audio, &block, portMAX_DELAY) != pdTRUE) continue;
@@ -237,6 +284,16 @@ void run_mic(tasr_stream_t *s)
             atomic_fetch_add_explicit(&g_gaps, 1, memory_order_relaxed);
         }
         expected = block.sequence + 1; have_sequence = 1;
+        if (block.session != recording_session) {
+            recording_session = block.session;
+            tasr_stream_reset(s); tasr_seg_next(&vad);
+            oled_status(usb_hid_status());
+        }
+        if (!block.session || block.session != usb_hid_session()) {
+            tasr_seg_vad(&vad, block.pcm, pcm, BLOCK_SAMPLES);
+            tasr_seg_next(&vad);
+            report_overflow(); continue;
+        }
         const int voiced = tasr_seg_vad(&vad, block.pcm, pcm, BLOCK_SAMPLES);
         if (voiced) { vad.speech = 1; vad.silence = 0; }
         else vad.silence++;
@@ -249,6 +306,7 @@ void run_mic(tasr_stream_t *s)
         if (vad.silence > TASR_SEG_HANG_BLOCKS) {
             tasr_stream_finish(s);
             printf("\r%s\n", tasr_stream_text(s));
+            usb_hid_submit(tasr_stream_text(s), recording_session);
             oled_push(tasr_stream_text(s));
             tasr_stream_reset(s);
             vad.speech = 0;
