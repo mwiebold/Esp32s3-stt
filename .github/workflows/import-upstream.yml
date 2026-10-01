@@ -36,3 +36,10 @@ jobs:
         run: >-
           make -C esp32/host -j2
           CFLAGS='-O2 -D_DEFAULT_SOURCE -std=c11 -ffp-contract=off -I../components/tinyasr/include -I../components/tinyasr -Wall -Wno-unused-function'
+      - name: Archive tracked source only
+        run: git archive --format=tar.gz HEAD > /tmp/esp32s3-stt-source.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tracked-source
+          path: /tmp/esp32s3-stt-source.tar.gz
+          retention-days: 3
