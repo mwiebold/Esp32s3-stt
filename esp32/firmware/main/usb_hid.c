@@ -21,13 +21,15 @@
 #if !defined(CONFIG_TASR_MODE_MIC) || !defined(CONFIG_IDF_TARGET_ESP32S3)
 #error USB dictation requires microphone mode on an ESP32-S3.
 #endif
-#if CONFIG_TINYUSB_HID_COUNT != 1
+#if CFG_TUD_HID != 1
 #error USB dictation requires CONFIG_TINYUSB_HID_COUNT=1 (use sdkconfig.usb_hid).
 #endif
 #if defined(CONFIG_TINYUSB_NO_DEFAULT_TASK) || CONFIG_TINYUSB_TASK_PRIORITY <= (configMAX_PRIORITIES - 2)
 #error The default TinyUSB task must outrank ASR; use sdkconfig.usb_hid.
 #endif
-#if defined(CONFIG_TINYUSB_CDC_ENABLED) || defined(CONFIG_TINYUSB_MSC_ENABLED) || CONFIG_TINYUSB_MIDI_COUNT || CONFIG_TINYUSB_VENDOR_COUNT
+// esp_tinyusb defines disabled CONFIG_*_ENABLED options as zero. Test the
+// effective class counts, not macro presence, after including tusb.h.
+#if CFG_TUD_CDC || CFG_TUD_MSC || CFG_TUD_MIDI || CFG_TUD_VENDOR || CFG_TUD_AUDIO || CFG_TUD_VIDEO || CFG_TUD_USBTMC || CFG_TUD_ECM_RNDIS || CFG_TUD_NCM || CFG_TUD_DFU || CFG_TUD_DFU_RUNTIME || CFG_TUD_BTH
 #error This configuration descriptor is keyboard-only; disable other USB classes.
 #endif
 
