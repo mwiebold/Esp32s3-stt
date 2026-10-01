@@ -1,0 +1,59 @@
+name: ESP32-S3 regression and firmware builds
+on:
+  push:
+    branches: [main]
+    paths: ['esp32/**', 'tests/**', '.github/workflows/ci.yml']
+  pull_request:
+    paths: ['esp32/**', 'tests/**', '.github/workflows/ci.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build and test with sanitizers
+        run: |
+          make -C esp32/host -j2
+          bash tests/run_host.sh
+          python3 -m compileall -q esp32/tools esp32/host
+          bash -n esp32/tools/emulate.sh esp32/tools/run_qemu.sh tests/run_host.sh
+      - name: Verify exact upstream parity
+        run: |
+          python3 -m pip install numpy
+          git worktree add --detach "$RUNNER_TEMP/upstream" d3de03f28364251651cc832f291197d0fab46d92
+          make -C "$RUNNER_TEMP/upstream/esp32/host" -j2 CFLAGS='-O2 -D_DEFAULT_SOURCE -std=c11 -ffp-contract=off -I../components/tinyasr/include -I../components/tinyasr -Wall -Wno-unused-function'
+          python3 -u tests/compare_upstream.py "$RUNNER_TEMP/upstream/esp32/host/libtinyasr.dylib" --full
+  firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: espressif/idf:v5.5
+    env:
+      IDF_TARGET: esp32s3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compile file, microphone/OLED, and opt-in experiment configurations
+        shell: bash
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh"
+          cd esp32/firmware
+          for mode in file mic experimental; do
+            defaults='sdkconfig.defaults;sdkconfig.nemo16bench'
+            if [[ "$mode" != file ]]; then defaults='sdkconfig.defaults;sdkconfig.nemo16lm;sdkconfig.mic;sdkconfig.oled'; fi
+            if [[ "$mode" == experimental ]]; then
+              printf '%s\n' 'CONFIG_TASR_NEMO_FLOAT_STATS=y' 'CONFIG_TASR_INFERENCE_TAIL_MS=200' 'CONFIG_TASR_PAR_MIN_WORK=4096' > sdkconfig.ci_experimental
+              defaults="$defaults;sdkconfig.ci_experimental"
+            fi
+            idf.py -B "build_ci_$mode" -D "SDKCONFIG=sdkconfig_ci_$mode" -D "SDKCONFIG_DEFAULTS=$defaults" build
+          done
