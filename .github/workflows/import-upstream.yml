@@ -1,0 +1,38 @@
+name: Import pinned Oido history
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-upstream.yml']
+permissions:
+  contents: write
+concurrency:
+  group: import-upstream
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Import original history without rewriting destination history
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream=d3de03f28364251651cc832f291197d0fab46d92
+          if test -e esp32/components/tinyasr/tasr_nemo.c; then
+            echo 'Upstream already imported; nothing to do.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/lokutor-ai/oido.git
+          git fetch upstream "$upstream"
+          test "$(git rev-parse FETCH_HEAD)" = "$upstream"
+          git merge --allow-unrelated-histories --no-edit "$upstream" -m "Import lokutor-ai/oido at $upstream with original history and licenses"
+          git push origin HEAD:main
+      - name: Compile baseline host engine on Linux
+        run: >-
+          make -C esp32/host -j2
+          CFLAGS='-O2 -D_DEFAULT_SOURCE -std=c11 -ffp-contract=off -I../components/tinyasr/include -I../components/tinyasr -Wall -Wno-unused-function'
