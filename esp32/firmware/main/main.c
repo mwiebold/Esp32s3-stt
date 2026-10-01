@@ -1,5 +1,5 @@
 // tinyasr firmware for ESP32-S3 (N16R8): transcribes the utterances stored in the "audio" partition
-// and reports transcript + real-time factor measured with the CPU cycle counter.
+// and reports transcript + real-time factor from the 64-bit monotonic timer.
 #include <stdio.h>
 #include <string.h>
 #include "esp_cpu.h"
@@ -14,6 +14,7 @@
 #include "tinyasr.h"
 #include "tinyasr_lm.h"
 #include "tasr_nemo.h"
+#include "mic.h"
 
 static const char *TAG = "tinyasr";
 
@@ -85,6 +86,8 @@ static void run_nemo(const uint8_t *blob, uint32_t blob_size)
     tasr_nemo_t *m = tasr_nemo_load(blob, blob_size);
     if (!m) { ESP_LOGE(TAG, "nemo model load failed"); return; }
     tasr_decoder_t *dec = NULL;
+    const int max_samples = 16000 * CONFIG_TASR_MAX_UTTERANCE_SECONDS;
+    const int max_frames = max_samples / 640 + 1;
     size_t lsize = 0;
     const uint8_t *lmp = map_partition(0x42, "lm", &lsize);
     uint32_t lbytes = 0;
@@ -93,25 +96,28 @@ static void run_nemo(const uint8_t *blob, uint32_t blob_size)
         tasr_lm_t *lm = tasr_lm_load(lmp + 16, lbytes);
         if (lm) {
             size_t mv = tasr_lm_to_ram(lm);
-            dec = tasr_decoder_create(lm, 1025, CONFIG_TASR_BEAM, 6, CONFIG_TASR_LM_WEIGHT_X100 / 100.0f,
-                                      CONFIG_TASR_TOKEN_BONUS_X100 / 100.0f);
+            dec = tasr_decoder_create_bounded(lm, 1025, CONFIG_TASR_BEAM, 6, CONFIG_TASR_LM_WEIGHT_X100 / 100.0f,
+                                              CONFIG_TASR_TOKEN_BONUS_X100 / 100.0f, max_frames);
+            if (!dec) { ESP_LOGE(TAG, "decoder allocation failed"); return; }
             ESP_LOGI(TAG, "LM %u bytes in PSRAM, beam %d", (unsigned)mv, CONFIG_TASR_BEAM);
         }
     }
-    size_t free_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    tasr_nemo_workspace_t *ws = tasr_nemo_workspace_create(m, max_samples, dec != NULL);
+    if (!ws) { ESP_LOGE(TAG, "NeMo workspace allocation failed"); return; }
 #ifdef CONFIG_TASR_MODE_MIC
-    const size_t reserve = 3600000;  // 20 s utterance buffers (~2.5 MB) + mic ring and recording buffer (0.9 MB)
-#else
-    const size_t reserve = 2700000;  // per-utterance buffers for clips up to 20 s (1.9 MB measured at 15 s)
+    if (!mic_nemo_prepare()) { ESP_LOGE(TAG, "audio buffer allocation failed"); tasr_nemo_workspace_free(ws); return; }
 #endif
-    size_t budget = free_ps > reserve ? free_ps - reserve : 0;
+    // Working storage is now actually allocated; only the remaining memory caches weights.
+    const size_t free_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t reserve = 128 * 1024;  // additional application/allocator headroom
+    const size_t budget = free_ps > reserve ? free_ps - reserve : 0;
+    ESP_LOGI(TAG, "workspace %u bytes, maximum %d samples", (unsigned)tasr_nemo_workspace_bytes(ws), max_samples);
     size_t moved = tasr_nemo_place_weights(m, budget);
     ESP_LOGI(TAG, "NeMo conformer-ctc-small: %u weight bytes, %u moved to PSRAM | free PSRAM %u internal %u",
              (unsigned)tasr_nemo_weight_bytes(m), (unsigned)moved, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #ifdef CONFIG_TASR_MODE_MIC
-    extern void run_mic_nemo(const tasr_nemo_t *m, struct tasr_decoder *dec);
-    run_mic_nemo(m, dec);
+    run_mic_nemo(ws, dec);
 #endif
     size_t asize = 0;
     const uint8_t *aud = map_partition(0x41, "audio", &asize);
@@ -119,7 +125,9 @@ static void run_nemo(const uint8_t *blob, uint32_t blob_size)
     uint32_t n_utt;
     memcpy(&n_utt, aud + 4, 4);
     const uint8_t *p = aud + 8;
-    double tot_audio = 0, tot_cycles = 0;
+    double tot_audio = 0;
+    uint64_t tot_us = 0, tot_cycles = 0;
+    tasr_nemo_profile_reset();
     static char text[4096];
     for (uint32_t u = 0; u < n_utt; u++) {
         uint32_t ns, tl;
@@ -127,21 +135,29 @@ static void run_nemo(const uint8_t *blob, uint32_t blob_size)
         const char *ref = (const char *)(p + 8);
         const int16_t *pcm = (const int16_t *)(p + 8 + ((tl + 3) & ~3u));
         p = (const uint8_t *)(pcm + ns + (ns & 1));
-        uint32_t c0 = esp_cpu_get_cycle_count();
-        tasr_nemo_transcribe(m, pcm, ns, dec, text, sizeof(text), NULL, 0, NULL);
-        uint32_t cyc = esp_cpu_get_cycle_count() - c0;
-        double sec = ns / 16000.0;
+        if (!ns || ns > (uint32_t)max_samples) { ESP_LOGE(TAG, "utterance exceeds configured capacity"); break; }
+        const int64_t t0 = esp_timer_get_time();
+        const uint32_t c0 = esp_cpu_get_cycle_count();
+        const int rc = tasr_nemo_transcribe_with_workspace(ws, pcm, (int)ns, dec, text, sizeof(text), NULL, 0, NULL);
+        const uint32_t cyc = esp_cpu_get_cycle_count() - c0;  // raw diagnostic, NOT whole-utterance elapsed time
+        const uint64_t elapsed_us = (uint64_t)(esp_timer_get_time() - t0);
+        if (rc < 0) { ESP_LOGE(TAG, "inference failed for utterance %u", (unsigned)u); break; }
+        const double sec = ns / 16000.0;
         tot_audio += sec;
+        tot_us += elapsed_us;
         tot_cycles += cyc;
-        printf("UTT %u | audio %.2fs | cycles %u | RTF %.3f\nREF: %.*s\nHYP: %s\n", (unsigned)u, sec, (unsigned)cyc,
-               cyc / CPU_HZ / sec, (int)tl, ref, text);
+        printf("UTT %u | audio %.6fs | cycle_delta32 %u | elapsed_us %llu | RTF %.6f\nREF: %.*s\nHYP: %s\n",
+               (unsigned)u, sec, (unsigned)cyc, (unsigned long long)elapsed_us, elapsed_us / 1e6 / sec,
+               (int)tl, ref, text);
     }
-    printf("TOTAL audio %.1fs cycles %.0f RTF@240MHz %.3f\n", tot_audio, tot_cycles, tot_cycles / CPU_HZ / tot_audio);
+    printf("TOTAL audio %.6fs elapsed_us %llu cycle_delta32_sum %llu RTF %.6f\n", tot_audio,
+           (unsigned long long)tot_us, (unsigned long long)tot_cycles, tot_audio > 0 ? tot_us / 1e6 / tot_audio : 0.0);
     printf("MEM min free PSRAM %u internal %u\n", (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     for (int i = 0; tasr_nemo_profile_name(i); i++)
-        printf("PROF %-10s %12llu cycles %5.1f%%\n", tasr_nemo_profile_name(i), (unsigned long long)tasr_nemo_profile_value(i),
-               100.0 * tasr_nemo_profile_value(i) / tot_cycles);
+        printf("PROF %-10s %12llu us %5.1f%%\n", tasr_nemo_profile_name(i), (unsigned long long)tasr_nemo_profile_value(i),
+               tot_us ? 100.0 * tasr_nemo_profile_value(i) / tot_us : 0.0);
+    tasr_nemo_workspace_free(ws);
     printf("DONE\n");
 }
 
@@ -150,6 +166,7 @@ void app_main(void)
     calibrate();
     tasr_alloc = fw_alloc;
     tasr_free = fw_free;
+    tasr_parallel_min_work = CONFIG_TASR_PAR_MIN_WORK;
 #ifndef TASR_SINGLE_CORE
     g_start = xSemaphoreCreateBinary();
     g_done = xSemaphoreCreateBinary();
@@ -201,7 +218,6 @@ void app_main(void)
     }
 #endif
 #ifdef CONFIG_TASR_MODE_MIC
-    extern void run_mic(tasr_stream_t *s);
     run_mic(s);
 #endif
     const int max_frames = 400, V1 = 257;

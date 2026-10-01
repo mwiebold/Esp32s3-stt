@@ -22,6 +22,7 @@ void (*tasr_free)(void *) = default_free;
 
 static void serial_parallel(tasr_job_fn fn, void *ctx, int n) { fn(ctx, 0, n, 0); }
 void (*tasr_parallel)(tasr_job_fn fn, void *ctx, int n) = serial_parallel;
+size_t tasr_parallel_min_work = 0;
 
 #ifdef TASR_PROFILE
 #ifdef ESP_PLATFORM

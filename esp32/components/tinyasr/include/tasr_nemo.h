@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 typedef struct tasr_nemo tasr_nemo_t;
+typedef struct tasr_nemo_workspace tasr_nemo_workspace_t;
 struct tasr_decoder;
 
 tasr_nemo_t *tasr_nemo_load(const uint8_t *blob, size_t size);
@@ -22,7 +23,19 @@ size_t tasr_nemo_place_weights(tasr_nemo_t *m, size_t budget);
 int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, struct tasr_decoder *dec, char *text,
                          int maxlen, float *logit_sink, int max_frames, int *n_frames);
 
-// profiling (TASR_PROFILE builds): per-stage cycle totals
+// Reusable scratch for a fixed model and sample capacity. Allocate BEFORE weight caching.
+// The model must outlive its workspace. One caller per workspace; no concurrent calls.
+// use_decoder reserves optional CTC beam scratch. Returns NULL on allocation failure.
+tasr_nemo_workspace_t *tasr_nemo_workspace_create(const tasr_nemo_t *m, int max_samples, int use_decoder);
+void tasr_nemo_workspace_free(tasr_nemo_workspace_t *ws);
+size_t tasr_nemo_workspace_bytes(const tasr_nemo_workspace_t *ws);
+// No heap allocations during inference. -1 = invalid input/capacity or decoder overflow.
+int tasr_nemo_transcribe_with_workspace(tasr_nemo_workspace_t *ws, const int16_t *pcm, int n,
+                                        struct tasr_decoder *dec, char *text, int maxlen,
+                                        float *logit_sink, int max_frames, int *n_frames);
+
+// Exclusive profiling (TASR_PROFILE): microseconds on ESP32, nanoseconds on host.
+void tasr_nemo_profile_reset(void);
 const char *tasr_nemo_profile_name(int i);
 uint64_t tasr_nemo_profile_value(int i);
 

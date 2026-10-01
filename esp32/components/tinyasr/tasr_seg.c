@@ -16,6 +16,7 @@ void tasr_seg_next(tasr_seg_t *s)
     s->speech = 0;
     s->silence = 0;
     s->voiced = 0;
+    s->last_voiced = 0;
 }
 
 int tasr_seg_vad(tasr_seg_t *s, const int16_t *in, int16_t *out, int k)
@@ -73,6 +74,7 @@ int tasr_seg_feed(tasr_seg_t *s, const int16_t *in, int k)
     const int take = k < room ? k : room;
     memcpy(s->buf + s->n, blk, sizeof(int16_t) * take);
     s->n += take;
+    if (voiced) s->last_voiced = s->n;
     if (s->silence > TASR_SEG_HANG_BLOCKS || s->n >= s->cap) {
         if (s->voiced >= TASR_SEG_MIN_VOICED) return s->n;
         s->speech = s->silence = s->voiced = 0;  // too short to be speech: back to idle, keep the tail as pre-roll
@@ -82,4 +84,12 @@ int tasr_seg_feed(tasr_seg_t *s, const int16_t *in, int k)
         }
     }
     return 0;
+}
+
+int tasr_seg_audio_samples(const tasr_seg_t *s, int tail_samples)
+{
+    if (!s || s->n <= 0) return 0;
+    if (tail_samples < 0 || s->last_voiced <= 0) return s->n;
+    const int trailing = s->n - s->last_voiced;
+    return tail_samples >= trailing ? s->n : s->last_voiced + tail_samples;
 }

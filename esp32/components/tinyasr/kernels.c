@@ -1,3 +1,6 @@
+#ifdef __FAST_MATH__
+#error "tinyasr quantization requires strict floating-point arithmetic; disable -ffast-math"
+#endif
 #include "kernels.h"
 #include <math.h>
 #include <string.h>

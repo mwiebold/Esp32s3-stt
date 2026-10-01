@@ -1,6 +1,7 @@
 // On-device CTC prefix beam search with GRU language-model shallow fusion (mirrors train/beam.py).
 // LM weights: int8 per-row (tasr_qlin row layout), activations dynamically quantized per step.
 #include <math.h>
+#include <limits.h>
 #include <string.h>
 #include "kernels.h"
 #include "tinyasr.h"
@@ -111,6 +112,9 @@ struct tasr_decoder {
     float *st_h, *st_lp;  // LM state pool: [slots][H], [slots][V]
     int16_t *free_slots;
     int n_free, max_slots;
+    cand_t *candidates;
+    float *scores;
+    int max_frames, frames, overflowed;
     beam_t beams[MAXB];
     int n_beams;
     int8_t *xq;
@@ -134,7 +138,7 @@ static void lm_gemm_job(void *c, int b, int e, int w)
 static void lm_qlin(tasr_decoder_t *d, const tasr_qlin_t *L, int T, float *y, int ldy)
 {
     lmjob_t j = {d, L, T, ldy, y};
-    tasr_parallel(lm_gemm_job, &j, L->n);  // split output rows across both cores
+    tasr_parallel_work(lm_gemm_job, &j, L->n, (size_t)T * L->n * L->k);  // split output rows across both cores
 }
 
 static int slot_alloc(tasr_decoder_t *d) { return d->n_free > 0 ? d->free_slots[--d->n_free] : -1; }
@@ -212,7 +216,7 @@ static int find_child(const tasr_decoder_t *d, int parent, int tok)
 }
 static int make_child(tasr_decoder_t *d, int parent, int tok, float lm, int len)
 {
-    if (d->n_nodes >= d->max_nodes) return -1;
+    if (d->n_nodes >= d->max_nodes) { d->overflowed = 1; return -1; }
     for (int probe = 0; probe < d->hash_cap; probe++) {
         int i = (hkey(parent, tok) + probe) & (d->hash_cap - 1);
         if (d->hash[i] < 0) {
@@ -235,6 +239,7 @@ static inline float logadd(float a, float b)
 
 void tasr_decoder_reset(tasr_decoder_t *d)
 {
+    d->frames = d->overflowed = 0;
     d->n_nodes = 1;
     d->nodes[0].parent = -1; d->nodes[0].tok = -1; d->nodes[0].len = 0; d->nodes[0].lm = 0.f; d->nodes[0].state = -1;
     for (int i = 0; i < d->hash_cap; i++) d->hash[i] = -1;
@@ -245,19 +250,35 @@ void tasr_decoder_reset(tasr_decoder_t *d)
     d->beams[0].node = 0; d->beams[0].pb = 0.f; d->beams[0].pnb = NEG;
 }
 
-tasr_decoder_t *tasr_decoder_create(const tasr_lm_t *lm, int V1, int beam, int topk, float lm_weight, float token_bonus)
+tasr_decoder_t *tasr_decoder_create_bounded(const tasr_lm_t *lm, int V1, int beam, int topk,
+                                             float lm_weight, float token_bonus, int max_frames)
 {
+    if (V1 < 2 || beam < 1 || topk < 1 || max_frames < 0 ||
+        (lm && lm->V != V1) || !isfinite(lm_weight) || !isfinite(token_bonus)) return NULL;
+    const int actual_beam = beam > MAXB ? MAXB : beam;
+    if (max_frames > (INT_MAX / 4 - 1) / actual_beam) return NULL;
     tasr_decoder_t *d = (tasr_decoder_t *)tasr_alloc(sizeof(tasr_decoder_t), 1);
+    if (!d) return NULL;
+    memset(d, 0, sizeof(*d));
     d->lm = lm; d->V1 = V1;
+    d->max_frames = max_frames;
     d->beam = beam > MAXB ? MAXB : beam;
     d->topk = topk > MAXK ? MAXK : topk;
     d->lm_weight = lm_weight; d->token_bonus = token_bonus;
     d->blank_skip_logp = logf(0.999f);
-    d->max_nodes = 16384;
+    const int candidates = d->beam * (1 + 2 * d->topk);
+    d->candidates = tasr_alloc(sizeof(cand_t) * candidates, 1);
+    d->scores = tasr_alloc(sizeof(float) * candidates, 1);
+    d->max_nodes = 16384;  // legacy unbounded API retains its original capacity
+    if (max_frames) {
+        const int need = 1 + d->beam * max_frames;
+        d->max_nodes = 1;
+        while (d->max_nodes < need) d->max_nodes *= 2;
+    }
     d->nodes = (node_t *)tasr_alloc(sizeof(node_t) * d->max_nodes, 0);
-    d->hash_cap = 32768;
+    d->hash_cap = 2 * d->max_nodes;
     d->hash = (int *)tasr_alloc(sizeof(int) * d->hash_cap, 0);
-    d->max_slots = 2 * MAXB + 2;
+    d->max_slots = 2 * d->beam + 2;
     d->free_slots = (int16_t *)tasr_alloc(sizeof(int16_t) * d->max_slots, 1);
     if (lm) {
         d->st_h = (float *)tasr_alloc(sizeof(float) * d->max_slots * lm->H, 0);
@@ -273,14 +294,29 @@ tasr_decoder_t *tasr_decoder_create(const tasr_lm_t *lm, int V1, int beam, int t
         d->acc = (int32_t *)tasr_alloc(sizeof(int32_t) * 64 * 16, 1);
         d->acc2 = (int32_t *)tasr_alloc(sizeof(int32_t) * 64 * 16, 1);
     }
+    if (!d->nodes || !d->hash || !d->free_slots || !d->candidates || !d->scores ||
+        (lm && (!d->st_h || !d->st_lp || !d->xq || !d->xs || !d->gi || !d->gh ||
+                !d->tmp || !d->wtmp || !d->wtmp2 || !d->acc || !d->acc2))) {
+        tasr_decoder_free(d);
+        return NULL;
+    }
     tasr_decoder_reset(d);
     return d;
 }
+
+tasr_decoder_t *tasr_decoder_create(const tasr_lm_t *lm, int V1, int beam, int topk,
+                                     float lm_weight, float token_bonus)
+{
+    return tasr_decoder_create_bounded(lm, V1, beam, topk, lm_weight, token_bonus, 0);
+}
+
+int tasr_decoder_overflowed(const tasr_decoder_t *d) { return d ? d->overflowed : 1; }
 
 void tasr_decoder_free(tasr_decoder_t *d)
 {
     if (!d) return;
     tasr_free(d->nodes); tasr_free(d->hash); tasr_free(d->free_slots);
+    tasr_free(d->candidates); tasr_free(d->scores);
     if (d->lm) {
         tasr_free(d->st_h); tasr_free(d->st_lp); tasr_free(d->xq); tasr_free(d->xs); tasr_free(d->gi);
         tasr_free(d->gh); tasr_free(d->tmp); tasr_free(d->wtmp); tasr_free(d->acc); tasr_free(d->wtmp2); tasr_free(d->acc2);
@@ -295,6 +331,9 @@ static inline float cand_score(const tasr_decoder_t *d, const cand_t *c)
 
 void tasr_decoder_step(tasr_decoder_t *d, const float *lp)
 {
+    if (!d || !lp || d->overflowed) return;
+    if (d->max_frames && d->frames >= d->max_frames) { d->overflowed = 1; return; }
+    if (d->frames < INT_MAX) d->frames++;
     if (lp[0] > d->blank_skip_logp) {  // blank-dominated frame
         for (int i = 0; i < d->n_beams; i++) {
             beam_t *b = &d->beams[i];
@@ -314,7 +353,7 @@ void tasr_decoder_step(tasr_decoder_t *d, const float *lp)
             cv[j] = x; cand[j] = v;
         }
     }
-    cand_t cs[MAXB * (1 + 2 * MAXK)];
+    cand_t *cs = d->candidates;
     int nn = 0;
     for (int i = 0; i < d->n_beams; i++) {
         const beam_t b = d->beams[i];
@@ -354,6 +393,9 @@ void tasr_decoder_step(tasr_decoder_t *d, const float *lp)
             }
         }
     }
+    // Candidate probabilities are now final: score once, not once per beam selection.
+    float *scores = d->scores;
+    for (int q = 0; q < nn; q++) scores[q] = cand_score(d, &cs[q]);
     // select best `beam` candidates
     beam_t old[MAXB];
     int n_old = d->n_beams;
@@ -364,7 +406,7 @@ void tasr_decoder_step(tasr_decoder_t *d, const float *lp)
         float bs = NEG;
         for (int q = 0; q < nn; q++) {
             if (cs[q].tok == -32768) continue;
-            float sc = cand_score(d, &cs[q]);
+            const float sc = scores[q];
             if (sc > bs) { bs = sc; best = q; }
         }
         if (best < 0) break;

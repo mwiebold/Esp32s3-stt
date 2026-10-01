@@ -1,3 +1,6 @@
+#ifdef __FAST_MATH__
+#error "tinyasr quantization requires strict floating-point arithmetic; disable -ffast-math"
+#endif
 // tasr_nemo: utterance-level engine for NVIDIA NeMo Conformer-CTC small (rel-pos MHSA, full context), int8.
 // Mirrors train/nemo_small.py + train/nemo_eval.py (--bits 8 --att8) arithmetic.
 #include <math.h>
@@ -17,23 +20,25 @@
 
 #ifdef TASR_PROFILE
 #ifdef ESP_PLATFORM
-#include "esp_cpu.h"
-static inline uint32_t nts(void) { return esp_cpu_get_cycle_count(); }
+#include "esp_timer.h"
+static inline uint64_t nts(void) { return (uint64_t)esp_timer_get_time(); }
 #else
 #include <time.h>
-static inline uint32_t nts(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000000000ull + t.tv_nsec); }
+static inline uint64_t nts(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
 #endif
-enum { N_FEAT, N_CONV0, N_IM2COL, N_CONV2, N_SUB, N_LN, N_GEMM, N_QUANT, N_ACT, N_QKV8, N_POS, N_ATT, N_DW, N_HEAD, N_NP };
+enum { N_FEAT, N_CONV0, N_IM2COL, N_CONV2, N_SUB, N_LN, N_GEMM, N_QUANT, N_ACT, N_QKV8, N_POS, N_ATT, N_DW, N_HEAD, N_LNQ, N_ACTQ, N_RES, N_GLU, N_NP };
 static const char *nprof_names[N_NP] = {"features", "conv0", "im2col", "gemm_fe", "gemm_k704", "layernorm", "gemm", "quant",
-                                        "act", "qkv_int8", "pos", "attention", "dwconv", "head+dec"};
+                                        "act", "qkv_int8", "pos", "attention", "dwconv", "head+dec", "norm+quant", "act+quant", "residual", "glu"};
 static uint64_t nprof[N_NP];
-#define NB(v) uint32_t v = nts()
-#define NE(v, c) nprof[c] += (uint32_t)(nts() - v)
+void tasr_nemo_profile_reset(void) { memset(nprof, 0, sizeof(nprof)); }
+#define NB(v) uint64_t v = nts()
+#define NE(v, c) nprof[c] += nts() - v
 const char *tasr_nemo_profile_name(int i) { return i < N_NP ? nprof_names[i] : 0; }
 uint64_t tasr_nemo_profile_value(int i) { return i < N_NP ? nprof[i] : 0; }
 #else
 #define NB(v)
 #define NE(v, c)
+void tasr_nemo_profile_reset(void) {}
 const char *tasr_nemo_profile_name(int i) { (void)i; return 0; }
 uint64_t tasr_nemo_profile_value(int i) { (void)i; return 0; }
 #endif
@@ -293,6 +298,7 @@ static void layernorm_row(const float *r, int d, nln_t p, float *o)
 // ------------------------------------------------------------------ work context
 typedef struct {
     const tasr_nemo_t *m;
+    tasr_nemo_workspace_t *workspace;
     int T;                       // encoder frames
     int ldq;
     int8_t *xq;                  // [RB][ldq]
@@ -309,6 +315,184 @@ typedef struct {
     int iacc_n;  // stride of the second (positional) score buffer in iacc[w]
     float *att;                  // [T][d]
 } nctx_t;
+
+// A workspace belongs to one caller and one model. No global allocator swapping.
+// Large buffers alias only when their phase lifetimes do not overlap; hot buffers
+// stay individually allocated so the firmware's internal-RAM size policy still applies.
+enum {
+    WS_XQ,
+    WS_XS,
+    WS_WTMP0,
+    WS_WTMP1,
+    WS_ACC0,
+    WS_ACC1,
+    WS_X,
+    WS_F,
+    WS_XQ_SUB,
+    WS_RING,
+    WS_C2OUT,
+    WS_FR,
+    WS_XS_SUB,
+    WS_COL,
+    WS_CMAXR,
+    WS_CMW,
+    WS_PE,
+    WS_PEQ,
+    WS_PES,
+    WS_QU,
+    WS_QV,
+    WS_K8,
+    WS_VT,
+    WS_P8,
+    WS_SQU,
+    WS_SQV,
+    WS_SK,
+    WS_SV,
+    WS_SP,
+    WS_SC0,
+    WS_SC1,
+    WS_PQ0,
+    WS_PQ1,
+    WS_IACC0,
+    WS_IACC1,
+    WS_HB,
+    WS_H2,
+    WS_GLB,
+    WS_CV,
+    WS_PROW,
+    WS_LG,
+    WS_LP,
+    WS_RFJ,
+    WS_RZ,
+    WS_RLO,
+    WS_RGI,
+    WS_RGH,
+    WS_RST,
+    WS_RE,
+    WS_COUNT
+};
+struct tasr_nemo_workspace {
+    const tasr_nemo_t *model;
+    int max_samples, use_decoder;
+    void *ptr[WS_COUNT];
+    uint8_t owned[WS_COUNT];
+    void *arena;
+    size_t bytes;
+};
+
+typedef struct { size_t size, off; int kind; unsigned phases; } nwbuf_t;
+
+void tasr_nemo_workspace_free(tasr_nemo_workspace_t *ws)
+{
+    if (!ws) return;
+    for (int i = 0; i < WS_COUNT; i++) if (ws->owned[i]) tasr_free(ws->ptr[i]);
+    tasr_free(ws->arena);
+    tasr_free(ws);
+}
+size_t tasr_nemo_workspace_bytes(const tasr_nemo_workspace_t *ws) { return ws ? ws->bytes : 0; }
+
+tasr_nemo_workspace_t *tasr_nemo_workspace_create(const tasr_nemo_t *m, int max_samples, int use_decoder)
+{
+    if (!m || max_samples < 2 * HOP) return NULL;
+    const int T0 = max_samples / HOP + 1, T1 = (T0 + 1) / 2, T = (T1 + 1) / 2;
+    const int d = m->d, H = m->h, dh = m->dh, dhp = m->dhp, sc = m->sc, f1 = m->f1, f2 = m->f2;
+    const int NP = 2 * T - 1, Tp = (T + 15) & ~15, halo = m->k / 2;
+    const int ldq = m->ff > 2 * d ? m->ff : 2 * d;
+    const int w2 = 3 * d > m->ff ? 3 * d : m->ff;
+    const int C2B = RB / f2 < 1 ? 1 : RB / f2;
+    const int unpack = m->L[0].ff1_1.bits == 4;
+    nwbuf_t plan[WS_COUNT] = {
+        [WS_XQ] = {(size_t)RB * ldq, 0, 1, 15},
+        [WS_XS] = {sizeof(float) * RB, 0, 1, 15},
+        [WS_WTMP0] = {unpack ? 16 * (size_t)ldq + 16 : 0, 0, 1, 15},
+        [WS_WTMP1] = {unpack ? 16 * (size_t)ldq + 16 : 0, 0, 1, 15},
+        [WS_ACC0] = {sizeof(int32_t) * RB * 16, 0, 1, 15},
+        [WS_ACC1] = {sizeof(int32_t) * RB * 16, 0, 1, 15},
+        [WS_X] = {sizeof(float) * (size_t)T * d, 0, 0, 15},
+        [WS_F] = {sizeof(float) * (size_t)T0 * NMEL, 0, 0, 1},
+        [WS_XQ_SUB] = {(size_t)RB * m->sub.kp, 0, 0, 1},
+        [WS_RING] = {sizeof(float) * 3 * (size_t)sc * (f1 + 2), 0, 0, 1},
+        [WS_C2OUT] = {sizeof(float) * C2B * (size_t)f2 * sc, 0, 0, 1},
+        [WS_FR] = {sizeof(float) * (size_t)sc * f2, 0, 0, 1},
+        [WS_XS_SUB] = {sizeof(float) * RB, 0, 1, 1},
+        [WS_COL] = {(size_t)C2B * f2 * m->c2.kp, 0, 0, 1},
+        [WS_CMAXR] = {sizeof(float) * 3 * (f1 + 2), 0, 1, 1},
+        [WS_CMW] = {sizeof(float) * NW * (f1 + 2), 0, 1, 1},
+        [WS_PE] = {sizeof(float) * (size_t)NP * d, 0, 0, 2},
+        [WS_PEQ] = {(size_t)NP * m->L[0].pos.kp, 0, 0, 6},
+        [WS_PES] = {sizeof(float) * NP, 0, 0, 6},
+        [WS_QU] = {(size_t)H * T * dhp, 0, 0, 4},
+        [WS_QV] = {(size_t)H * T * dhp, 0, 0, 4},
+        [WS_K8] = {(size_t)H * T * dhp, 0, 0, 4},
+        [WS_VT] = {(size_t)H * dh * Tp, 0, 0, 4},
+        [WS_P8] = {(size_t)H * NP * dhp, 0, 0, 4},
+        [WS_SQU] = {sizeof(float) * (size_t)H * T, 0, 0, 4},
+        [WS_SQV] = {sizeof(float) * (size_t)H * T, 0, 0, 4},
+        [WS_SK] = {sizeof(float) * (size_t)H * T, 0, 0, 4},
+        [WS_SV] = {sizeof(float) * (size_t)H * T, 0, 0, 4},
+        [WS_SP] = {sizeof(float) * (size_t)H * NP, 0, 0, 4},
+        [WS_SC0] = {sizeof(float) * Tp, 0, 1, 4},
+        [WS_SC1] = {sizeof(float) * Tp, 0, 1, 4},
+        [WS_PQ0] = {(size_t)Tp, 0, 1, 4},
+        [WS_PQ1] = {(size_t)Tp, 0, 1, 4},
+        [WS_IACC0] = {sizeof(int32_t) * 2 * (Tp > RB ? Tp : RB), 0, 1, 4},
+        [WS_IACC1] = {sizeof(int32_t) * 2 * (Tp > RB ? Tp : RB), 0, 1, 4},
+        [WS_HB] = {sizeof(float) * RB * d, 0, 1, 4},
+        [WS_H2] = {sizeof(float) * RB * w2, 0, 0, 4},
+        [WS_GLB] = {sizeof(float) * (size_t)(T + 2 * halo) * d, 0, 0, 4},
+        [WS_CV] = {sizeof(float) * (size_t)T * d, 0, 0, 4},
+        [WS_PROW] = {sizeof(float) * RB * d, 0, 0, 4},
+        [WS_LG] = {m->rnnt ? 0 : sizeof(float) * RB * (size_t)(m->V + 1), 0, 0, 8},
+        [WS_LP] = {use_decoder && !m->rnnt ? sizeof(float) * (size_t)(m->V + 1) : 0, 0, 0, 8},
+        [WS_RFJ] = {m->rnnt ? sizeof(float) * (size_t)T * 320 : 0, 0, 0, 8},
+        [WS_RZ] = {m->rnnt ? sizeof(float) * 8 * 320 : 0, 0, 0, 8},
+        [WS_RLO] = {m->rnnt ? sizeof(float) * 8 * (size_t)(m->V + 1) : 0, 0, 0, 8},
+        [WS_RGI] = {m->rnnt ? sizeof(float) * 4 * 320 : 0, 0, 0, 8},
+        [WS_RGH] = {m->rnnt ? sizeof(float) * 4 * 320 : 0, 0, 0, 8},
+        [WS_RST] = {m->rnnt ? sizeof(float) * 3 * 320 : 0, 0, 0, 8},
+        [WS_RE] = {m->rnnt ? sizeof(float) * 320 : 0, 0, 0, 8},
+    };
+    tasr_nemo_workspace_t *ws = tasr_alloc(sizeof(*ws), 1);
+    if (!ws) return NULL;
+    memset(ws, 0, sizeof(*ws));
+    ws->model = m; ws->max_samples = max_samples; ws->use_decoder = use_decoder;
+    ws->bytes = sizeof(*ws);
+    size_t arena_size = 0;
+    for (int i = 0; i < WS_COUNT; i++) {
+        if (!plan[i].size) continue;
+        if (plan[i].size > SIZE_MAX - 15) goto fail;
+        plan[i].size = (plan[i].size + 15) & ~(size_t)15;
+        if (plan[i].kind) {
+            ws->ptr[i] = tasr_alloc(plan[i].size, 1);
+            if (!ws->ptr[i]) goto fail;
+            ws->owned[i] = 1;
+            ws->bytes += plan[i].size;
+            continue;
+        }
+        // First-fit interval packing; at most WS_COUNT objects, only at creation.
+        size_t off = 0;
+        for (int j = 0; j < i;) {
+            if (plan[j].kind || !(plan[i].phases & plan[j].phases) || !plan[j].size) { j++; continue; }
+            if (off > SIZE_MAX - plan[i].size) goto fail;
+            if (off < plan[j].off + plan[j].size && plan[j].off < off + plan[i].size) {
+                off = plan[j].off + plan[j].size;
+                j = 0;
+            } else j++;
+        }
+        if (off > SIZE_MAX - plan[i].size) goto fail;
+        plan[i].off = off;
+        if (off + plan[i].size > arena_size) arena_size = off + plan[i].size;
+    }
+    ws->arena = tasr_alloc(arena_size, 0);
+    if (!ws->arena) goto fail;
+    ws->bytes += arena_size;
+    for (int i = 0; i < WS_COUNT; i++)
+        if (!plan[i].kind && plan[i].size) ws->ptr[i] = (uint8_t *)ws->arena + plan[i].off;
+    return ws;
+fail:
+    tasr_nemo_workspace_free(ws);
+    return NULL;
+}
 
 typedef struct {
     nctx_t *c;
@@ -328,7 +512,7 @@ static void nqlin(nctx_t *c, const tasr_qlin_t *L, int T, float *y, int ldy)
 {
     NB(t0);
     ngemm_t j = {c, L, T, y, ldy};
-    tasr_parallel(ngemm_job, &j, L->blocked ? L->n / 16 : L->n);
+    tasr_parallel_work(ngemm_job, &j, L->blocked ? L->n / 16 : L->n, (size_t)T * L->n * L->k);
     NE(t0, L->kp > 1024 ? N_CONV2 : L->kp > 256 ? N_SUB : N_GEMM);  // front-end GEMMs / long-K layers / K <= 256
 }
 static void nq_job(void *p, int b, int e, int w);
@@ -337,7 +521,7 @@ static void nquant(nctx_t *c, const float *x, int T, int K, int ldx, int kp)
     NB(t0);
     typedef struct { const float *x; int K, ldx, kp; nctx_t *c; } nqj2_t;
     nqj2_t j = {x, K, ldx, kp, c};
-    tasr_parallel(nq_job, &j, T);
+    tasr_parallel_work(nq_job, &j, T, (size_t)T * K * 3);
     NE(t0, N_QUANT);
 }
 
@@ -516,21 +700,38 @@ static void nfeat_job(void *p, int b, int e, int w)
         }
     }
 }
-static float *nemo_features(const tasr_nemo_t *m, const int16_t *pcm, int n, int *T_out)
+static float *nemo_features(const tasr_nemo_t *m, const int16_t *pcm, int n, int *T_out, float *F)
 {
     const int nvalid = n / HOP, T = nvalid + 1;
-    float *F = (float *)tasr_alloc(sizeof(float) * (size_t)T * NMEL, 0);
     nfeat_t fj = {m, pcm, n, F};
-    tasr_parallel(nfeat_job, &fj, T);
+    tasr_parallel_work(nfeat_job, &fj, T, (size_t)T * 2048);
+    // Visit contiguous rows; each channel still accumulates frames in the original order.
+#ifdef TASR_NEMO_FLOAT_STATS
+    typedef float stat_t;  // experimental: opt-in, changes numerical results
+#else
+    typedef double stat_t;
+#endif
+    stat_t mean[NMEL] = {0}, var[NMEL] = {0};
+    float sd[NMEL];
+    for (int t = 0; t < nvalid; t++)
+        for (int j = 0; j < NMEL; j++) mean[j] += F[(size_t)t * NMEL + j];
+    for (int j = 0; j < NMEL; j++) mean[j] /= nvalid;
+    for (int t = 0; t < nvalid; t++)
+        for (int j = 0; j < NMEL; j++) {
+            stat_t v = F[(size_t)t * NMEL + j] - mean[j];
+            var[j] += v * v;
+        }
     for (int j = 0; j < NMEL; j++) {
-        double mean = 0, var = 0;
-        for (int t = 0; t < nvalid; t++) mean += F[(size_t)t * NMEL + j];
-        mean /= nvalid;
-        for (int t = 0; t < nvalid; t++) { double v = F[(size_t)t * NMEL + j] - mean; var += v * v; }
-        const float sd = (float)sqrt(var / (nvalid > 1 ? nvalid - 1 : 1)) + 1e-5f;
-        for (int t = 0; t < nvalid; t++) F[(size_t)t * NMEL + j] = (F[(size_t)t * NMEL + j] - (float)mean) / sd;
-        F[(size_t)nvalid * NMEL + j] = 0.f;
+#ifdef TASR_NEMO_FLOAT_STATS
+        sd[j] = sqrtf(var[j] / (nvalid > 1 ? nvalid - 1 : 1)) + 1e-5f;
+#else
+        sd[j] = (float)sqrt(var[j] / (nvalid > 1 ? nvalid - 1 : 1)) + 1e-5f;
+#endif
     }
+    for (int t = 0; t < nvalid; t++)
+        for (int j = 0; j < NMEL; j++)
+            F[(size_t)t * NMEL + j] = (F[(size_t)t * NMEL + j] - (float)mean[j]) / sd[j];
+    memset(F + (size_t)nvalid * NMEL, 0, sizeof(float) * NMEL);
     *T_out = T;
     return F;
 }
@@ -657,6 +858,103 @@ static void nq_job(void *p, int b, int e, int w)
                     j->c->xs + b);
 }
 
+// Fused row jobs keep pointwise intermediates local and use one dispatch per stage.
+typedef struct {
+    nctx_t *c;
+    const float *x;
+    int K, kp;
+    nln_t norm;
+} nlnqj_t;
+static void nlnq_job(void *p, int b, int e, int w)
+{
+    (void)w;
+    nlnqj_t *j = p;
+    float row[j->K];
+    for (int t = b; t < e; t++) {
+        layernorm_row(j->x + (size_t)t * j->K, j->K, j->norm, row);
+        tasr_quant_rows(row, 1, j->K, j->K, j->c->xq + (size_t)t * j->c->ldq,
+                        j->c->ldq, j->kp, j->c->xs + t);
+    }
+}
+static void nln_quant(nctx_t *c, const float *x, int T, int K, nln_t norm, int kp)
+{
+    NB(t0);
+    nlnqj_t j = {c, x, K, kp, norm};
+    tasr_parallel_work(nlnq_job, &j, T, (size_t)T * K * 6);
+    NE(t0, N_LNQ);
+}
+typedef struct { nctx_t *c; float *x; int K, kp; } nactqj_t;
+static void nactq_job(void *p, int b, int e, int w)
+{
+    (void)w;
+    nactqj_t *j = p;
+    for (int t = b; t < e; t++) {
+        float *row = j->x + (size_t)t * j->K;
+        for (int k = 0; k < j->K; k++) row[k] = row[k] * nsig(row[k]);
+        tasr_quant_rows(row, 1, j->K, j->K, j->c->xq + (size_t)t * j->c->ldq,
+                        j->c->ldq, j->kp, j->c->xs + t);
+    }
+}
+static void nact_quant(nctx_t *c, float *x, int T, int K, int kp)
+{
+    NB(t0);
+    nactqj_t j = {c, x, K, kp};
+    tasr_parallel_work(nactq_job, &j, T, (size_t)T * K * 4);
+    NE(t0, N_ACTQ);
+}
+typedef struct { float *x; const float *y; int d; float scale; const nln_t *norm; } nresj_t;
+static void nres_job(void *p, int b, int e, int w)
+{
+    (void)w;
+    nresj_t *j = p;
+    for (int t = b; t < e; t++) {
+        float *row = j->x + (size_t)t * j->d;
+        for (int k = 0; k < j->d; k++) row[k] += j->scale * j->y[(size_t)t * j->d + k];
+        if (j->norm) layernorm_row(row, j->d, *j->norm, row);
+    }
+}
+static void nresidual(float *x, const float *y, int T, int d, float scale, const nln_t *norm)
+{
+    NB(t0);
+    nresj_t j = {x, y, d, scale, norm};
+    tasr_parallel_work(nres_job, &j, T, (size_t)T * d * (norm ? 6 : 2));
+    NE(t0, N_RES);
+}
+typedef struct { const float *x; float *out; int d; } ngluj_t;
+static void nglu_job(void *p, int b, int e, int w)
+{
+    (void)w;
+    ngluj_t *j = p;
+    for (int t = b; t < e; t++) {
+        const float *g = j->x + (size_t)t * 2 * j->d;
+        float *o = j->out + (size_t)t * j->d;
+        for (int ch = 0; ch < j->d; ch++) o[ch] = g[ch] * nsig(g[j->d + ch]);
+    }
+}
+typedef struct { nctx_t *c; const nlayer_t *L; const float *h2; int t0, tn; } nqkvj_t;
+static void nqkv_job(void *p, int b, int e, int w)
+{
+    (void)w;
+    nqkvj_t *j = p;
+    nctx_t *c = j->c;
+    const int T = c->T, d = c->m->d, dh = c->m->dh, dhp = c->m->dhp;
+    float tmp[64];
+    int8_t vtmp[64];
+    // A worker owns whole heads, including the transposed V output.
+    for (int hh = b; hh < e; hh++) for (int t = 0; t < j->tn; t++) {
+        const int ti = j->t0 + t;
+        const float *q = j->h2 + (size_t)t * 3 * d, *k = q + d, *v = q + 2 * d;
+        for (int k2 = 0; k2 < dh; k2++) tmp[k2] = q[hh * dh + k2] + j->L->pbu[hh * dh + k2];
+        c->squ[hh * T + ti] = qvec(tmp, dh, c->qu + ((size_t)hh * T + ti) * dhp, dhp);
+        for (int k2 = 0; k2 < dh; k2++) tmp[k2] = q[hh * dh + k2] + j->L->pbv[hh * dh + k2];
+        c->sqv[hh * T + ti] = qvec(tmp, dh, c->qv + ((size_t)hh * T + ti) * dhp, dhp);
+        c->sk[hh * T + ti] = qvec(k + hh * dh, dh, c->k8 + ((size_t)hh * T + ti) * dhp, dhp);
+        c->sv[hh * T + ti] = qvec(v + hh * dh, dh, vtmp, dh);
+        int8_t *vt = c->vt + (size_t)hh * dh * c->Tp + ti;
+        for (int k2 = 0; k2 < dh; k2++) vt[(size_t)k2 * c->Tp] = vtmp[k2];
+    }
+}
+
 // ------------------------------------------------------------------ RNN-T greedy decoding
 // Exactly NeMo's greedy transducer search (up to 5 symbols per frame), with int8 GEMVs for the LSTM and joint network.
 #define RNNT_P 320
@@ -669,7 +967,7 @@ typedef struct {
 static void rnnt_pred_step(const tasr_nemo_t *m, nctx_t *C, const float *xin, rnnt_state_t *st)
 {
     const int P = RNNT_P;
-    static float gi[4 * RNNT_P], gh[4 * RNNT_P];
+    float *gi = C->workspace->ptr[WS_RGI], *gh = C->workspace->ptr[WS_RGH];
     nquant(C, xin, 1, P, P, m->r_ih.kp);
     nqlin(C, &m->r_ih, 1, gi, 4 * P);
     nquant(C, st->h, 1, P, P, m->r_hh.kp);
@@ -686,19 +984,19 @@ static void rnnt_pred_step(const tasr_nemo_t *m, nctx_t *C, const float *xin, rn
 static void rnnt_greedy(const tasr_nemo_t *m, nctx_t *C, const float *x, int T, char *text, int maxlen, int *len)
 {
     const int P = RNNT_P, d = m->d, V1 = m->V + 1;
-    float *fj = (float *)tasr_alloc(sizeof(float) * (size_t)T * P, 0);  // joint encoder projection, all frames
+    float *fj = (float *)C->workspace->ptr[WS_RFJ];  // joint encoder projection, all frames
     for (int t0 = 0; t0 < T; t0 += RB) {
         const int tn = T - t0 < RB ? T - t0 : RB;
         nquant(C, x + (size_t)t0 * d, tn, d, d, m->r_jenc.kp);
         nqlin(C, &m->r_jenc, tn, fj + (size_t)t0 * P, P);
     }
-    static rnnt_state_t st;
-    static float e[RNNT_P];
-    float *z = (float *)tasr_alloc(sizeof(float) * RNNT_B * P, 0);
-    float *lo = (float *)tasr_alloc(sizeof(float) * RNNT_B * V1, 0);
-    memset(&st, 0, sizeof(st));
-    memset(e, 0, sizeof(e));
-    rnnt_pred_step(m, C, e, &st);  // start of sequence: zero input
+    rnnt_state_t *state = C->workspace->ptr[WS_RST];
+    float *e = C->workspace->ptr[WS_RE];
+    float *z = (float *)C->workspace->ptr[WS_RZ];
+    float *lo = (float *)C->workspace->ptr[WS_RLO];
+    memset(state, 0, sizeof(*state));
+    memset(e, 0, sizeof(float) * RNNT_P);
+    rnnt_pred_step(m, C, e, state);  // start of sequence: zero input
     // Most frames emit only blank and leave the prediction state unchanged, so the joint network is evaluated for up to
     // RNNT_B frames at once with the current state (one pass over its 328 KB output matrix instead of one per frame).
     // Rows after the first frame that emits a token are discarded and recomputed, so the result is exactly greedy search.
@@ -708,7 +1006,7 @@ static void rnnt_greedy(const tasr_nemo_t *m, nctx_t *C, const float *x, int T, 
         for (int i = 0; i < nb; i++) {
             const float *f = fj + (size_t)(t + i) * P;
             float *zi = z + (size_t)i * P;
-            for (int j = 0; j < P; j++) { const float v = f[j] + st.gp[j]; zi[j] = v > 0.f ? v : 0.f; }
+            for (int j = 0; j < P; j++) { const float v = f[j] + state->gp[j]; zi[j] = v > 0.f ? v : 0.f; }
         }
         nquant(C, z, nb, P, P, m->r_jout.kp);
         nqlin(C, &m->r_jout, nb, lo, V1);
@@ -724,7 +1022,7 @@ static void rnnt_greedy(const tasr_nemo_t *m, nctx_t *C, const float *x, int T, 
         const float *f = fj + (size_t)(t + i) * P;
         for (int s = 0; s < RNNT_MAXSYM; s++) {
             if (s > 0) {
-                for (int j = 0; j < P; j++) { const float v = f[j] + st.gp[j]; z[j] = v > 0.f ? v : 0.f; }
+                for (int j = 0; j < P; j++) { const float v = f[j] + state->gp[j]; z[j] = v > 0.f ? v : 0.f; }
                 nquant(C, z, 1, P, P, m->r_jout.kp);
                 nqlin(C, &m->r_jout, 1, lo, V1);
                 k = 0;
@@ -737,53 +1035,56 @@ static void rnnt_greedy(const tasr_nemo_t *m, nctx_t *C, const float *x, int T, 
             }
             const int8_t *er = m->r_emb.w + (size_t)k * m->r_emb.kp;  // embedding row, dequantized
             for (int j = 0; j < P; j++) e[j] = (float)er[j] * m->r_emb.s[k];
-            rnnt_pred_step(m, C, e, &st);
+            rnnt_pred_step(m, C, e, state);
         }
         t += i + 1;
     }
-    tasr_free(z);
-    tasr_free(lo);
-    tasr_free(fj);
 }
 
 // ------------------------------------------------------------------ main entry
-int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_decoder_t *dec, char *text, int maxlen,
-                         float *logit_sink, int max_frames, int *n_frames)
+int tasr_nemo_transcribe_with_workspace(tasr_nemo_workspace_t *ws, const int16_t *pcm, int n,
+                                        tasr_decoder_t *dec, char *text, int maxlen,
+                                        float *logit_sink, int max_frames, int *n_frames)
 {
+    if (n_frames) *n_frames = 0;
+    if (text && maxlen > 0) text[0] = 0;
+    if (!ws || !pcm || n < 0 || n > ws->max_samples || maxlen < 0 || max_frames < 0 ||
+        (maxlen && !text) || (dec && !ws->use_decoder)) return -1;
+    const tasr_nemo_t *m = ws->model;
     nsig_init();
     nexp_init();
     if (n < 2 * HOP) { if (maxlen) text[0] = 0; return 0; }
     const int d = m->d, H = m->h, dh = m->dh, dhp = m->dhp, sc = m->sc, f1 = m->f1, f2 = m->f2;
     int T0;
     NB(tf);
-    float *F = nemo_features(m, pcm, n, &T0);
+    float *F = nemo_features(m, pcm, n, &T0, ws->ptr[WS_F]);
     NE(tf, N_FEAT);
     const int T1 = (T0 - 1) / 2 + 1, T = (T1 - 1) / 2 + 1;
     nctx_t C;
     memset(&C, 0, sizeof(C));
-    C.m = m; C.T = T;
+    C.m = m; C.T = T; C.workspace = ws;
     C.ldq = m->ff > 2 * d ? m->ff : 2 * d;   // layer activations (K <= ff)
-    C.xq = (int8_t *)tasr_alloc((size_t)RB * C.ldq, 1);
-    C.xs = (float *)tasr_alloc(sizeof(float) * RB, 1);
-    int8_t *xq_sub = (int8_t *)tasr_alloc((size_t)RB * m->sub.kp, 0);   // front-end projection rows (K = 3520)
+    C.xq = (int8_t *)ws->ptr[WS_XQ];
+    C.xs = (float *)ws->ptr[WS_XS];
+    int8_t *xq_sub = (int8_t *)ws->ptr[WS_XQ_SUB];   // front-end projection rows (K = 3520)
     for (int w = 0; w < NW; w++) {
-        C.wtmp[w] = (int8_t *)tasr_alloc(16 * C.ldq + 16, 1);
-        C.acc[w] = (int32_t *)tasr_alloc(sizeof(int32_t) * 64 * 16, 1);
+        C.wtmp[w] = (int8_t *)ws->ptr[WS_WTMP0 + w];
+        C.acc[w] = (int32_t *)ws->ptr[WS_ACC0 + w];
     }
-    float *x = (float *)tasr_alloc(sizeof(float) * (size_t)T * d, 0);
+    float *x = (float *)ws->ptr[WS_X];
     // ---- striding conv subsampling, pipelined over output frames
     {
-        float *ring = (float *)tasr_alloc(sizeof(float) * 3 * sc * (f1 + 2), 0);  // conv0 rows (r % 3), padded
+        float *ring = (float *)ws->ptr[WS_RING];  // conv0 rows (r % 3), padded
         // conv2 runs as one GEMM per C2B output frames (C2B * f2 <= RB patch rows), so its weights are fetched once per
         // C2B frames instead of once per frame
         const int C2B = RB / f2 < 1 ? 1 : RB / f2;
-        float *c2out = (float *)tasr_alloc(sizeof(float) * C2B * f2 * sc, 0);    // [C2B * f2][sc]
-        float *fr = (float *)tasr_alloc(sizeof(float) * sc * f2, 0);       // one sub_out input row (float)
-        float *xs_sub = (float *)tasr_alloc(sizeof(float) * RB, 1);          // its per-row scales
-        int8_t *col = (int8_t *)tasr_alloc((size_t)C2B * f2 * m->c2.kp, 0);
+        float *c2out = (float *)ws->ptr[WS_C2OUT];    // [C2B * f2][sc]
+        float *fr = (float *)ws->ptr[WS_FR];       // one sub_out input row (float)
+        float *xs_sub = (float *)ws->ptr[WS_XS_SUB];          // its per-row scales
+        int8_t *col = (int8_t *)ws->ptr[WS_COL];
         int nbat = 0;
-        float *cmaxr = (float *)tasr_alloc(sizeof(float) * 3 * (f1 + 2), 1);  // per ring row: max over channels
-        float *cmw = (float *)tasr_alloc(sizeof(float) * NW * (f1 + 2), 1);
+        float *cmaxr = (float *)ws->ptr[WS_CMAXR];  // per ring row: max over channels
+        float *cmw = (float *)ws->ptr[WS_CMW];
         int have = -1, nflat = 0, t_flat0 = 0;
         for (int t2 = 0; t2 < T; t2++) {
             for (int r = 2 * t2 - 1; r <= 2 * t2 + 1; r++) {  // conv0 output rows needed
@@ -799,7 +1100,7 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
                 }
                 nc0_t j = {m, (const float(*)[NMEL + 2])P, ring + (size_t)(r % 3) * sc * (f1 + 2), cmw};
                 memset(cmw, 0, sizeof(float) * NW * (f1 + 2));  // a worker that gets no channels leaves zeros
-                tasr_parallel(nc0_job, &j, sc);
+                tasr_parallel_work(nc0_job, &j, sc, (size_t)sc * f1 * 9);
                 {
                     float *cm = cmaxr + (size_t)(r % 3) * (f1 + 2);
                     for (int f = 0; f < f1 + 2; f++) {
@@ -822,7 +1123,7 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
                     j.rows[dt] = (r >= 0 && r < T1) ? ring + (size_t)(r % 3) * sc * (f1 + 2) : NULL;
                     j.cmax[dt] = cmaxr + (size_t)((r + 3) % 3) * (f1 + 2);
                 }
-                tasr_parallel(nim_job, &j, f2);
+                tasr_parallel_work(nim_job, &j, f2, (size_t)f2 * m->c2.k);
             }
             NE(tim, N_IM2COL);
             if (++nbat < C2B && t2 < T - 1) continue;
@@ -859,16 +1160,15 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
             }
             nbat = 0;
         }
-        tasr_free(ring); tasr_free(c2out); tasr_free(fr); tasr_free(xs_sub); tasr_free(col); tasr_free(cmaxr); tasr_free(cmw);
+
     }
-    tasr_free(F);
-    tasr_free(xq_sub);
+
     const float xscale = sqrtf((float)d);
     for (int i = 0; i < T * d; i++) x[i] *= xscale;
     // ---- relative positional encodings (int8, shared by all layers before linear_pos)
     const int NP = 2 * T - 1;
     C.Tp = (T + 15) & ~15;
-    float *pe = (float *)tasr_alloc(sizeof(float) * (size_t)NP * d, 0);
+    float *pe = (float *)ws->ptr[WS_PE];
     NB(tpe);
     for (int i = 0; i < d / 2; i++) {
         // row r holds position (T-1-r): step the angle by -div with a rotation, re-anchored every 64 rows
@@ -888,72 +1188,58 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
     }
     // the positional rows are the same input to every layer's linear_pos: quantize them to int8 once
     const int kpp = m->L[0].pos.kp;
-    int8_t *peq = (int8_t *)tasr_alloc((size_t)NP * kpp, 0);
-    float *pes = (float *)tasr_alloc(sizeof(float) * NP, 0);
+    int8_t *peq = (int8_t *)ws->ptr[WS_PEQ];
+    float *pes = (float *)ws->ptr[WS_PES];
     tasr_quant_rows(pe, NP, d, d, peq, kpp, kpp, pes);
-    tasr_free(pe);
+
     NE(tpe, N_POS);
-    C.qu = (int8_t *)tasr_alloc((size_t)H * T * dhp, 0);
-    C.qv = (int8_t *)tasr_alloc((size_t)H * T * dhp, 0);
-    C.k8 = (int8_t *)tasr_alloc((size_t)H * T * dhp, 0);
-    C.vt = (int8_t *)tasr_alloc((size_t)H * dh * C.Tp, 0);
-    C.p8 = (int8_t *)tasr_alloc((size_t)H * NP * dhp, 0);
-    C.squ = (float *)tasr_alloc(sizeof(float) * H * T, 0);
-    C.sqv = (float *)tasr_alloc(sizeof(float) * H * T, 0);
-    C.sk = (float *)tasr_alloc(sizeof(float) * H * T, 0);
-    C.sv = (float *)tasr_alloc(sizeof(float) * H * T, 0);
-    C.sp = (float *)tasr_alloc(sizeof(float) * H * NP, 0);
+    C.qu = (int8_t *)ws->ptr[WS_QU];
+    C.qv = (int8_t *)ws->ptr[WS_QV];
+    C.k8 = (int8_t *)ws->ptr[WS_K8];
+    C.vt = (int8_t *)ws->ptr[WS_VT];
+    C.p8 = (int8_t *)ws->ptr[WS_P8];
+    C.squ = (float *)ws->ptr[WS_SQU];
+    C.sqv = (float *)ws->ptr[WS_SQV];
+    C.sk = (float *)ws->ptr[WS_SK];
+    C.sv = (float *)ws->ptr[WS_SV];
+    C.sp = (float *)ws->ptr[WS_SP];
     for (int w = 0; w < NW; w++) {
-        C.sc[w] = (float *)tasr_alloc(sizeof(float) * C.Tp, 1);
-        C.pq[w] = (int8_t *)tasr_alloc(C.Tp, 1);
+        C.sc[w] = (float *)ws->ptr[WS_SC0 + w];
+        C.pq[w] = (int8_t *)ws->ptr[WS_PQ0 + w];
         C.iacc_n = C.Tp > 64 ? C.Tp : 64;
-        C.iacc[w] = (int32_t *)tasr_alloc(sizeof(int32_t) * 2 * C.iacc_n, 1);
+        C.iacc[w] = (int32_t *)ws->ptr[WS_IACC0 + w];
     }
-    float *hb = (float *)tasr_alloc(sizeof(float) * RB * d, 1);           // LN outputs (row block)
-    const int w2 = 3 * d > m->ff ? 3 * d : m->ff;
-    float *h2 = (float *)tasr_alloc(sizeof(float) * RB * w2, 0);
+    float *hb = (float *)ws->ptr[WS_HB];           // LN outputs (row block)
+    float *h2 = (float *)ws->ptr[WS_H2];
     const int halo = m->k / 2;
-    float *glb = (float *)tasr_alloc(sizeof(float) * (size_t)(T + 2 * halo) * d, 0);  // GLU outputs with zero halo
+    float *glb = (float *)ws->ptr[WS_GLB];  // GLU outputs with zero halo
+    // Phase-shared storage is not globally cleared between utterances.
+    // Only the depthwise convolution's leading/trailing halo requires zeros.
+    memset(glb, 0, sizeof(float) * (size_t)halo * d);
+    memset(glb + (size_t)(halo + T) * d, 0, sizeof(float) * (size_t)halo * d);
     float *gl = glb + (size_t)halo * d;
-    float *cv = (float *)tasr_alloc(sizeof(float) * (size_t)T * d, 0);
+    float *cv = (float *)ws->ptr[WS_CV];
     C.att = cv;  // attention output is consumed by linear_out before the conv module writes cv
-    float *prow = (float *)tasr_alloc(sizeof(float) * RB * d, 0);
-    int8_t vtmp[64];
+    float *prow = (float *)ws->ptr[WS_PROW];
     for (int li = 0; li < m->nl; li++) {
         const nlayer_t *L = &m->L[li];
         // FF1 (half step), row blocks
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
-            nln_rows(x + (size_t)t0 * d, tn, d, L->n_ff1, hb);
-            nquant(&C, hb, tn, d, d, L->ff1_1.kp);
+            nln_quant(&C, x + (size_t)t0 * d, tn, d, L->n_ff1, L->ff1_1.kp);
             nqlin(&C, &L->ff1_1, tn, h2, m->ff);
-            nsilu(h2, tn * m->ff);
-            nquant(&C, h2, tn, m->ff, m->ff, L->ff1_2.kp);
+            nact_quant(&C, h2, tn, m->ff, L->ff1_2.kp);
             nqlin(&C, &L->ff1_2, tn, hb, d);
-            for (int i = 0; i < tn * d; i++) x[(size_t)t0 * d + i] += 0.5f * hb[i];
+            nresidual(x + (size_t)t0 * d, hb, tn, d, 0.5f, NULL);
         }
         // MHSA: q/k/v for all frames (int8 per head), positional rows, then attention per head
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
-            nln_rows(x + (size_t)t0 * d, tn, d, L->n_att, hb);
-            nquant(&C, hb, tn, d, d, L->qkv.kp);
+            nln_quant(&C, x + (size_t)t0 * d, tn, d, L->n_att, L->qkv.kp);
             nqlin(&C, &L->qkv, tn, h2, 3 * d);
             NB(tq8);
-            for (int t = 0; t < tn; t++) {
-                const int ti = t0 + t;
-                const float *q = h2 + (size_t)t * 3 * d, *k = q + d, *v = q + 2 * d;
-                float tmp[64];
-                for (int hh = 0; hh < H; hh++) {
-                    for (int e = 0; e < dh; e++) tmp[e] = q[hh * dh + e] + L->pbu[hh * dh + e];
-                    C.squ[hh * T + ti] = qvec(tmp, dh, C.qu + ((size_t)hh * T + ti) * dhp, dhp);
-                    for (int e = 0; e < dh; e++) tmp[e] = q[hh * dh + e] + L->pbv[hh * dh + e];
-                    C.sqv[hh * T + ti] = qvec(tmp, dh, C.qv + ((size_t)hh * T + ti) * dhp, dhp);
-                    C.sk[hh * T + ti] = qvec(k + hh * dh, dh, C.k8 + ((size_t)hh * T + ti) * dhp, dhp);
-                    C.sv[hh * T + ti] = qvec(v + hh * dh, dh, vtmp, dh);
-                    int8_t *vt = C.vt + (size_t)hh * dh * C.Tp + ti;
-                    for (int e = 0; e < dh; e++) vt[(size_t)e * C.Tp] = vtmp[e];
-                }
-            }
+            nqkvj_t qj = {&C, L, h2, t0, tn};
+            tasr_parallel_work(nqkv_job, &qj, H, (size_t)tn * d * 8);
             NE(tq8, N_QKV8);
         }
         for (int hh = 0; hh < H; hh++)
@@ -979,76 +1265,68 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
         {
             NB(ta);
             natt_t aj = {&C};
-            tasr_parallel(natt_job, &aj, H);
+            tasr_parallel_work(natt_job, &aj, H, (size_t)H * T * T * dh);
             NE(ta, N_ATT);
         }
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
             nquant(&C, C.att + (size_t)t0 * d, tn, d, d, L->out.kp);
             nqlin(&C, &L->out, tn, hb, d);
-            for (int i = 0; i < tn * d; i++) x[(size_t)t0 * d + i] += hb[i];
+            nresidual(x + (size_t)t0 * d, hb, tn, d, 1.0f, NULL);
         }
         // conv module: LN -> pw1 -> GLU (all frames) -> dw k=31 (+BN) -> swish -> pw2
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
-            nln_rows(x + (size_t)t0 * d, tn, d, L->n_conv, hb);
-            nquant(&C, hb, tn, d, d, L->pw1.kp);
+            nln_quant(&C, x + (size_t)t0 * d, tn, d, L->n_conv, L->pw1.kp);
             nqlin(&C, &L->pw1, tn, h2, 2 * d);
-            for (int t = 0; t < tn; t++) {
-                const float *g = h2 + (size_t)t * 2 * d;
-                float *o = gl + (size_t)(t0 + t) * d;
-                for (int ch = 0; ch < d; ch++) o[ch] = g[ch] * nsig(g[d + ch]);
-            }
+            NB(tgl);
+            ngluj_t gj = {h2, gl + (size_t)t0 * d, d};
+            tasr_parallel_work(nglu_job, &gj, tn, (size_t)tn * d * 4);
+            NE(tgl, N_GLU);
         }
         {
             NB(td);
             ndw_t j = {glb, cv, L, T, d, m->k};
-            tasr_parallel(ndw_job, &j, T);
+            tasr_parallel_work(ndw_job, &j, T, (size_t)T * d * m->k);
             NE(td, N_DW);
         }
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
             nquant(&C, cv + (size_t)t0 * d, tn, d, d, L->pw2.kp);
             nqlin(&C, &L->pw2, tn, hb, d);
-            for (int i = 0; i < tn * d; i++) x[(size_t)t0 * d + i] += hb[i];
+            nresidual(x + (size_t)t0 * d, hb, tn, d, 1.0f, NULL);
         }
         // FF2 (half step) + final LN
         for (int t0 = 0; t0 < T; t0 += RB) {
             const int tn = T - t0 < RB ? T - t0 : RB;
-            nln_rows(x + (size_t)t0 * d, tn, d, L->n_ff2, hb);
-            nquant(&C, hb, tn, d, d, L->ff2_1.kp);
+            nln_quant(&C, x + (size_t)t0 * d, tn, d, L->n_ff2, L->ff2_1.kp);
             nqlin(&C, &L->ff2_1, tn, h2, m->ff);
-            nsilu(h2, tn * m->ff);
-            nquant(&C, h2, tn, m->ff, m->ff, L->ff2_2.kp);
+            nact_quant(&C, h2, tn, m->ff, L->ff2_2.kp);
             nqlin(&C, &L->ff2_2, tn, hb, d);
-            for (int t = 0; t < tn; t++) {
-                float *r = x + (size_t)(t0 + t) * d;
-                for (int i = 0; i < d; i++) r[i] += 0.5f * hb[(size_t)t * d + i];
-                layernorm_row(r, d, L->n_out, r);
-            }
+            nresidual(x + (size_t)t0 * d, hb, tn, d, 0.5f, &L->n_out);
         }
     }
-    NB(thd);
     if (m->rnnt) {
+        NB(thd);
+#ifdef TASR_PROFILE
+        const uint64_t nested0 = nprof[N_QUANT] + nprof[N_GEMM] + nprof[N_SUB] + nprof[N_CONV2];
+#endif
         int len = 0;
         if (maxlen) text[0] = 0;
         rnnt_greedy(m, &C, x, T, text, maxlen, &len);
         NE(thd, N_HEAD);
+#ifdef TASR_PROFILE
+        nprof[N_HEAD] -= nprof[N_QUANT] + nprof[N_GEMM] + nprof[N_SUB] + nprof[N_CONV2] - nested0;
+#endif
         if (n_frames) *n_frames = T;
         if (maxlen && text[0] == ' ') memmove(text, text + 1, strlen(text));
-        tasr_free(x); tasr_free(peq); tasr_free(pes); tasr_free(C.qu); tasr_free(C.qv); tasr_free(C.k8);
-        tasr_free(C.vt); tasr_free(C.p8); tasr_free(C.squ); tasr_free(C.sqv); tasr_free(C.sk); tasr_free(C.sv);
-        tasr_free(C.sp); tasr_free(hb); tasr_free(h2); tasr_free(glb); tasr_free(cv); tasr_free(prow);
-        tasr_free(C.xq); tasr_free(C.xs);
-        for (int w = 0; w < NW; w++) {
-            tasr_free(C.wtmp[w]); tasr_free(C.acc[w]); tasr_free(C.sc[w]); tasr_free(C.pq[w]); tasr_free(C.iacc[w]);
-        }
+
         return T;
     }
     // ---- CTC head (blank = V) -> greedy or beam decoder (which expects blank at index 0)
     const int V1 = m->V + 1;
-    float *lg = (float *)tasr_alloc(sizeof(float) * RB * V1, 0);
-    float *lp = (float *)tasr_alloc(sizeof(float) * V1, 0);
+    float *lg = (float *)ws->ptr[WS_LG];
+    float *lp = (float *)ws->ptr[WS_LP];
     int prev = -1, len = 0, nf = 0;
     if (dec) tasr_decoder_reset(dec);
     if (maxlen) text[0] = 0;
@@ -1057,6 +1335,7 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
         nquant(&C, x + (size_t)t0 * d, tn, d, d, m->head.kp);
         nqlin(&C, &m->head, tn, lg, V1);
         for (int t = 0; t < tn; t++) {
+            NB(tdec);
             const float *l = lg + (size_t)t * V1;
             if (logit_sink && nf < max_frames) memcpy(logit_sink + (size_t)nf * V1, l, sizeof(float) * V1);
             nf++;
@@ -1070,13 +1349,16 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
                 lp[0] = l[m->V] - lz;
                 for (int v = 0; v < m->V; v++) lp[v + 1] = l[v] - lz;
                 tasr_decoder_step(dec, lp);
+                if (tasr_decoder_overflowed(dec)) { if (maxlen) text[0] = 0; return -1; }
             } else if (best != prev && best != m->V && maxlen) {
                 const int nl = m->tok_len[best];
                 if (len + nl + 1 < maxlen) { memcpy(text + len, m->tok[best], nl); len += nl; text[len] = 0; }
             }
             prev = best;
+            NE(tdec, N_HEAD);
         }
     }
+    NB(tfinish);
     if (dec && maxlen) {
         int toks[2048];
         const int nt = tasr_decoder_best(dec, toks, 2048);
@@ -1085,16 +1367,24 @@ int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_d
             if (len + nl + 1 < maxlen) { memcpy(text + len, m->tok[toks[i]], nl); len += nl; text[len] = 0; }
         }
     }
-    NE(thd, N_HEAD);
+    NE(tfinish, N_HEAD);
     if (n_frames) *n_frames = nf;
     if (maxlen && text[0] == ' ') memmove(text, text + 1, strlen(text));
-    // free
-    tasr_free(lg); tasr_free(lp); tasr_free(x); tasr_free(peq); tasr_free(pes); tasr_free(C.qu); tasr_free(C.qv); tasr_free(C.k8);
-    tasr_free(C.vt); tasr_free(C.p8); tasr_free(C.squ); tasr_free(C.sqv); tasr_free(C.sk); tasr_free(C.sv);
-    tasr_free(C.sp); tasr_free(hb); tasr_free(h2); tasr_free(glb); tasr_free(cv); tasr_free(prow);
-    tasr_free(C.xq); tasr_free(C.xs);
-    for (int w = 0; w < NW; w++) {
-        tasr_free(C.wtmp[w]); tasr_free(C.acc[w]); tasr_free(C.sc[w]); tasr_free(C.pq[w]); tasr_free(C.iacc[w]);
-    }
+
     return T;
+}
+
+// Compatibility wrapper: callers doing repeated inference should retain a workspace.
+int tasr_nemo_transcribe(const tasr_nemo_t *m, const int16_t *pcm, int n, tasr_decoder_t *dec, char *text, int maxlen,
+                         float *logit_sink, int max_frames, int *n_frames)
+{
+    if (n_frames) *n_frames = 0;
+    if (text && maxlen > 0) text[0] = 0;
+    if (!m || !pcm || n < 0 || maxlen < 0 || max_frames < 0 || (maxlen && !text)) return -1;
+    if (n < 2 * HOP) return 0;
+    tasr_nemo_workspace_t *ws = tasr_nemo_workspace_create(m, n, dec != NULL);
+    if (!ws) return -1;
+    const int rc = tasr_nemo_transcribe_with_workspace(ws, pcm, n, dec, text, maxlen, logit_sink, max_frames, n_frames);
+    tasr_nemo_workspace_free(ws);
+    return rc;
 }

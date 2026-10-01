@@ -46,6 +46,13 @@ void tasr_profile_reset(void);
 // Parallelism hook: run fn over [0, n) split across workers (worker ids 0..1). Default: serial.
 typedef void (*tasr_job_fn)(void *ctx, int begin, int end, int worker);
 extern void (*tasr_parallel)(tasr_job_fn fn, void *ctx, int n);
+// Optional cost threshold; set before starting inference. Default 0 preserves dispatch.
+extern size_t tasr_parallel_min_work;
+static inline void tasr_parallel_work(tasr_job_fn fn, void *ctx, int n, size_t work)
+{
+    if (n < 2 || work < tasr_parallel_min_work) fn(ctx, 0, n, 0);
+    else tasr_parallel(fn, ctx, n);
+}
 
 // Memory hooks (default: aligned malloc). kind: 0 = large/slow ok (PSRAM), 1 = hot (internal SRAM preferred)
 extern void *(*tasr_alloc)(size_t size, int kind);

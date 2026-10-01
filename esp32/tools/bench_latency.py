@@ -11,8 +11,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..", "..")
 sys.path.insert(0, os.path.join(ROOT, "eval"))
 from wer_utils import load_librispeech, wer  # noqa: E402
+from bench_metrics import estimated_rows
 
-HANG = 0.8          # end-of-utterance silence the VAD waits for (s)
+HANG = 0.82          # end-of-utterance silence the VAD waits for (s)
 CRIT = 0.55         # share of instructions on the dual-core critical path
 CPI = (1.3, 1.6)    # cycles per instruction range
 STALL = 0.08        # flash/PSRAM stall allowance, s per s of audio
@@ -44,14 +45,10 @@ def main():
     else:
         env.pop("TASR_LM", None)
     out = subprocess.run([os.path.join(HERE, "run_qemu.sh"), os.path.abspath(a.model), "/tmp/qlat"] + args,
-                         env=env, capture_output=True, text=True).stdout
-    utts = re.findall(r"UTT (\d+) \| audio ([\d.]+)s \| cycles (\d+).*?\nREF: (.*)\nHYP: (.*)", out)
-    rows = []
-    for k, dur, cyc, ref, hyp in utts:
-        dur, instr = float(dur), int(cyc) * 25
-        comp = [instr * CRIT * c / 240e6 + STALL * dur for c in CPI]
-        rows.append(dict(audio_s=dur, instr_M=instr / 1e6, compute_s=comp, text_after_s=[HANG + c for c in comp],
-                         ref=ref, hyp=hyp))
+                         env=env, capture_output=True, text=True, check=True).stdout
+    rows = estimated_rows(out, critical=CRIT, cpi=CPI, stall=STALL, hang=HANG)
+    if len(rows) != len(pick):
+        raise RuntimeError(f"Only {len(rows)} of {len(pick)} utterances completed")
     w = wer([r["ref"] for r in rows], [r["hyp"] for r in rows])[0]
     print(f"{os.path.basename(a.model)}: {len(rows)} utterances, {sum(r['audio_s'] for r in rows):.1f} s audio, WER {w:.1f}%")
     print(" audio | M instr | est. compute (s) | text after you stop (s) | hypothesis")
@@ -60,7 +57,7 @@ def main():
               f"{r['text_after_s'][0]:.1f}-{r['text_after_s'][1]:.1f} | {r['hyp'][:60]}")
     lo = sorted(r["text_after_s"][0] for r in rows)
     hi = sorted(r["text_after_s"][1] for r in rows)
-    summ = dict(model=os.path.basename(a.model), n=len(rows), wer=w, median_text_after_s=[lo[len(lo) // 2], hi[len(hi) // 2]],
+    summ = dict(estimated=True, timing_source="calibrated_qemu_icount", model=os.path.basename(a.model), n=len(rows), wer=w, median_text_after_s=[lo[len(lo) // 2], hi[len(hi) // 2]],
                 max_text_after_s=[lo[-1], hi[-1]], rows=rows)
     print(f"median time-to-text {summ['median_text_after_s'][0]:.1f}-{summ['median_text_after_s'][1]:.1f} s, "
           f"worst {summ['max_text_after_s'][0]:.1f}-{summ['max_text_after_s'][1]:.1f} s")

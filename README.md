@@ -1,3 +1,15 @@
+# ESP32-S3 STT
+
+Performance-focused derivative of [Lokutor Oído](https://github.com/lokutor-ai/oido).
+See [performance changes, configuration, and validation](docs/PERFORMANCE.md).
+Upstream Git history and licenses are preserved. The default inference path retains
+strict arithmetic; silence trimming and float statistics are opt-in experiments.
+
+**The benchmark figures below are upstream's published results, not measurements
+of this derivative. No new physical-board speed or accuracy result is claimed.**
+
+---
+
 # Oído: speech recognition that fits in a $5 chip
 
 *¡Oído!* is what cooks call out in a Spanish kitchen to confirm an order: *heard, got it*.

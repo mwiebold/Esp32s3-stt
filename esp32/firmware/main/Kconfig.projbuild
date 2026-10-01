@@ -37,8 +37,36 @@ menu "tinyasr"
     config TASR_LEFT
         int "Attention history in chunks"
         default 2
+    config TASR_MAX_UTTERANCE_SECONDS
+        int "Maximum NeMo utterance seconds (workspace and decoder capacity)"
+        range 1 20
+        default 20
+    config TASR_UTTERANCE_BUFFERS
+        int "Live utterance buffers (recording + queued/inference)"
+        range 2 4
+        default 3
+    config TASR_INFERENCE_TAIL_MS
+        int "Experimental inference silence tail in ms (-1 keeps all)"
+        range -1 820
+        default -1
+        help
+            Does not shorten the endpoint wait. A shorter inference slice changes
+            utterance normalization and therefore requires WER validation.
+    config TASR_NEMO_FLOAT_STATS
+        bool "Experimental single-precision feature statistics"
+        default n
+        help
+            Uses the ESP32-S3 FPU for normalization statistics; changes arithmetic.
+            Leave disabled until recognition accuracy has been revalidated.
+    config TASR_PAR_MIN_WORK
+        int "Minimum estimated scalar work for a parallel dispatch (0 preserves all)"
+        range 0 1000000
+        default 0
+        help
+            Hardware-tunable threshold. Small jobs run on the calling core.
     config TASR_BEAM
         int "Beam width when an LM partition is present"
+        range 1 16
         default 4
     config TASR_LM_WEIGHT_X100
         int "LM weight x100"
